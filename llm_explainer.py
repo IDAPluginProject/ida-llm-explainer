@@ -8,6 +8,14 @@ the function's comment, visible in both views), ask to Reason More (send a
 follow-up question and get a refined answer), or Cancel (discard, no
 database changes).
 
+Two settings help the model reason about code that calls into other
+functions: "Follow calls depth" eagerly includes the code of called
+functions (up to N levels) in the initial prompt, and independently of
+that, the model can ask for a specific called function's code on demand
+mid-conversation (it replies with a `REQUEST_CODE: <name-or-address>`
+line, the plugin fetches that function and feeds the code back
+automatically, up to "Max on-demand code requests" times).
+
 Install by copying this single file into one of:
   - Per-user (recommended, no admin rights needed):
         <IDA user dir>\\plugins\\llm_explainer.py
@@ -45,6 +53,7 @@ import idc
 import ida_kernwin
 import ida_funcs
 import ida_lines
+import ida_name
 
 try:
     import ida_hexrays
@@ -66,16 +75,53 @@ CONFIG_FILENAME = "llm_explainer.cfg.json"
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert reverse engineer assisting inside IDA Pro. You will "
-    "be given the decompiled pseudocode or disassembly of a single function, "
-    "along with its name, address, target architecture, and the names of "
-    "functions it calls. Explain concisely and precisely what the function "
-    "does: its purpose, inputs and outputs, notable algorithms or "
-    "protocol/format handling, and any security-relevant behavior (e.g. "
-    "unsafe string/memory operations, crypto, network I/O). Do not restate "
-    "the code line by line. Respond in plain text without markdown code "
-    "fences, since your answer will be written directly into an IDA "
-    "function comment. Keep the initial answer under ~200 words unless "
-    "asked for more detail in a follow-up."
+    "be given the decompiled pseudocode or disassembly of a target function, "
+    "along with its name, address, target architecture, the names of "
+    "functions it calls, and - depending on settings - the code of some "
+    "called functions already included below the target function.\n\n"
+    "If understanding the target function requires seeing the code of a "
+    "called function that was NOT already included, you may request it: "
+    "reply with one or more lines of the exact form\n"
+    "REQUEST_CODE: <function name or address>\n"
+    "and nothing else in that reply. You will then be given that function's "
+    "code in a follow-up message and can continue reasoning. Only request "
+    "functions that are actually relevant, and never request the same "
+    "function twice.\n\n"
+    "Once you have enough information, give your final answer as exactly "
+    "ONE short sentence (no more than ~20 words) stating precisely what the "
+    "target function does - its core purpose only, not a step-by-step "
+    "walkthrough. Do not restate the code line by line, and do not use "
+    "markdown code fences or bullet points. This one sentence will be "
+    "written verbatim into an IDA function comment, so keep it self-"
+    "contained and free of REQUEST_CODE lines. If asked for more detail in "
+    "a follow-up, you may then answer at greater length.\n\n"
+    "In that same final answer only (never in a REQUEST_CODE-only reply), "
+    "end with one extra line of the exact form\n"
+    "SUGGESTED_NAME: <name>\n"
+    "proposing a better name for the target function, based on what it "
+    "actually does. The name must be a valid C identifier: letters, digits "
+    "and underscores only, not starting with a digit, no spaces. Prefer "
+    "short, conventional reverse-engineering style names (e.g. "
+    "parse_http_header, aes_decrypt_block). Omit this line only if the "
+    "function is already named descriptively and a rename would not help.\n\n"
+    "If, and only if, the target function's own code was given to you as "
+    "Hex-Rays pseudocode (not plain disassembly), also try to infer better "
+    "types and names for its return value, arguments, and local variables:\n"
+    "1. If you can determine a more accurate prototype than the one shown "
+    "(return type, argument types, and/or argument names), add one line of "
+    "the exact form\n"
+    "SUGGESTED_SIGNATURE: <full C declaration>\n"
+    "e.g. SUGGESTED_SIGNATURE: int __cdecl parse_header(char *buf, int len)\n"
+    "Use this only for the return type and the function's own arguments, "
+    "never for local variables.\n"
+    "2. For local variables (not arguments) whose default compiler-generated "
+    "name (e.g. v1, v2, a1) could be replaced with something more "
+    "descriptive, add one line per variable of the exact form\n"
+    "SUGGESTED_VAR: <current_name> -> <new_name>\n"
+    "Only propose types or variable names you are reasonably confident "
+    "about from the code itself; skip anything uncertain. Omit both kinds "
+    "of lines entirely when you were given plain disassembly instead of "
+    "pseudocode, or when you have nothing confident to suggest."
 )
 
 DEFAULT_CONFIG = {
@@ -83,16 +129,45 @@ DEFAULT_CONFIG = {
     "model": "",
     "api_key": "",
     "temperature": 0.2,
-    "max_tokens": 1024,
-    "request_timeout": 30,
+    "max_tokens": 16384,
+    "request_timeout": 300,
     "max_context_chars": 12000,
     "include_callees": True,
     "max_callees": 20,
+    "follow_calls_depth": 0,
+    "max_total_context_chars": 40000,
+    "max_auto_fetch": 5,
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "explain_hotkey": "Ctrl-Alt-E",
 }
 
 ContextBundle = namedtuple("ContextBundle", ["kind", "text"])
+
+# Safety valve for eager recursive call-following: never eagerly decompile
+# more than this many functions for one initial request, regardless of the
+# configured depth/char budget (deep or wide call graphs could otherwise
+# make the initial request very slow).
+_MAX_EAGER_FUNCTIONS = 40
+
+_REQUEST_CODE_RE = re.compile(r"(?im)^\s*REQUEST_CODE:\s*(.+?)\s*$")
+_SUGGESTED_NAME_RE = re.compile(r"(?im)^\s*SUGGESTED_NAME:\s*(.+?)\s*$")
+_SUGGESTED_SIGNATURE_RE = re.compile(r"(?im)^\s*SUGGESTED_SIGNATURE:\s*(.+?)\s*$")
+_SUGGESTED_VAR_RE = re.compile(r"(?im)^\s*SUGGESTED_VAR:\s*([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*)\s*$")
+_VALID_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_AUTO_NAME_RE = re.compile(r"^(sub|loc|nullsub|j_sub|j_nullsub)_[0-9A-Fa-f]+$")
+
+
+def sanitize_suggested_name(name):
+    if not name:
+        return None
+    name = name.strip().strip("`'\"").rstrip(".")
+    if _VALID_NAME_RE.match(name):
+        return name
+    return None
+
+
+def is_auto_generated_name(name):
+    return bool(name) and bool(_AUTO_NAME_RE.match(name))
 
 
 # ---------------------------------------------------------------------------
@@ -146,38 +221,108 @@ def gather_function_context(func):
     return ContextBundle(kind="disassembly", text="\n".join(lines))
 
 
-def gather_callees(func, max_callees):
+def gather_callee_funcs(func, max_callees):
+    """Direct callees of func, as func_t objects, in first-seen order."""
     if max_callees <= 0:
         return []
-    names = []
+    result = []
     seen = set()
     for ea in idautils.FuncItems(func.start_ea):
         for ref in idautils.CodeRefsFrom(ea, 0):
             callee = ida_funcs.get_func(ref)
-            if callee and callee.start_ea == ref and ref != func.start_ea:
-                name = ida_funcs.get_func_name(ref)
-                if name and name not in seen:
-                    seen.add(name)
-                    names.append(name)
-        if len(names) >= max_callees:
+            if callee and callee.start_ea == ref and ref != func.start_ea and ref not in seen:
+                seen.add(ref)
+                result.append(callee)
+        if len(result) >= max_callees:
             break
-    return names[:max_callees]
+    return result[:max_callees]
 
 
-def build_user_message(config, func, ctx, callees):
+def format_function_block(label, func_ea, ctx, config):
+    name = ida_funcs.get_func_name(func_ea) or ("sub_%X" % func_ea)
+    body = ctx.text
+    if len(body) > config.max_context_chars:
+        body = body[: config.max_context_chars] + "\n...[truncated]..."
+    kind_label = "Pseudocode (Hex-Rays)" if ctx.kind == "pseudocode" else "Disassembly"
+    return "--- %s: %s @ %#010x (%s) ---\n%s" % (label, name, func_ea, kind_label, body)
+
+
+def gather_recursive_context(root_func, config):
+    """Breadth-first walk of the call graph starting at root_func, up to
+    config.follow_calls_depth levels. Returns a list of
+    (depth, func_ea, ContextBundle) tuples, root first (depth 0). Bounded by
+    config.max_total_context_chars and _MAX_EAGER_FUNCTIONS to keep the
+    initial request fast even for large/recursive call graphs.
+    """
+    visited = {root_func.start_ea}
+    root_ctx = gather_function_context(root_func)
+    blocks = [(0, root_func.start_ea, root_ctx)]
+    total_chars = len(root_ctx.text)
+    frontier = [root_func]
+    depth = 0
+    while (
+        depth < config.follow_calls_depth
+        and frontier
+        and total_chars < config.max_total_context_chars
+        and len(visited) < _MAX_EAGER_FUNCTIONS
+    ):
+        next_frontier = []
+        for func in frontier:
+            for callee in gather_callee_funcs(func, config.max_callees):
+                if callee.start_ea in visited:
+                    continue
+                if total_chars >= config.max_total_context_chars or len(visited) >= _MAX_EAGER_FUNCTIONS:
+                    break
+                visited.add(callee.start_ea)
+                try:
+                    ctx = gather_function_context(callee)
+                except Exception:
+                    continue
+                blocks.append((depth + 1, callee.start_ea, ctx))
+                total_chars += len(ctx.text)
+                next_frontier.append(callee)
+        frontier = next_frontier
+        depth += 1
+    return blocks
+
+
+def resolve_function_query(query):
+    """Resolve a model-supplied identifier (name or address) to a func_t."""
+    query = (query or "").strip().strip("`'\"")
+    if not query:
+        return None
+    ea = idc.get_name_ea_simple(query)
+    if ea == idaapi.BADADDR:
+        for base in (0, 16):
+            try:
+                ea = int(query, base)
+                break
+            except ValueError:
+                ea = idaapi.BADADDR
+    if ea == idaapi.BADADDR:
+        return None
+    return ida_funcs.get_func(ea)
+
+
+def build_user_message(config, func, blocks, callee_names):
     name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
     header = (
         "Function: %s\n"
         "Address: %#010x\n"
         "Architecture: %s\n" % (name, func.start_ea, get_procname())
     )
-    if callees:
-        header += "Calls: %s\n" % ", ".join(callees)
-    body = ctx.text
-    if len(body) > config.max_context_chars:
-        body = body[: config.max_context_chars] + "\n...[truncated]..."
-    kind_label = "Pseudocode (Hex-Rays)" if ctx.kind == "pseudocode" else "Disassembly"
-    return "%s\n--- %s ---\n%s" % (header, kind_label, body)
+    if callee_names:
+        header += "Calls: %s\n" % ", ".join(callee_names)
+    if config.follow_calls_depth > 0:
+        header += (
+            "Code for up to %d level(s) of called functions is included "
+            "below where available.\n" % config.follow_calls_depth
+        )
+    parts = [header]
+    for depth, ea, ctx in blocks:
+        label = "Target function" if depth == 0 else ("Called function (depth %d)" % depth)
+        parts.append(format_function_block(label, ea, ctx, config))
+    return "\n".join(parts)
 
 
 def _resolve_func(ctx):
@@ -187,12 +332,45 @@ def _resolve_func(ctx):
     return ida_funcs.get_func(ea)
 
 
-def _write_comment_and_refresh(func_ea, comment):
+def _apply_suggestions_and_refresh(func_ea, comment, new_name=None, signature=None, var_renames=None):
     try:
         idc.set_func_cmt(func_ea, comment, 0)
     except Exception as exc:
         ida_kernwin.msg("[%s] Failed to set comment: %s\n" % (PLUGIN_NAME, exc))
-        return 0
+
+    if signature:
+        try:
+            decl = signature.strip()
+            if not decl.endswith(";"):
+                decl += ";"
+            if not idc.SetType(func_ea, decl):
+                ida_kernwin.msg("[%s] Failed to apply signature: %s\n" % (PLUGIN_NAME, signature))
+        except Exception as exc:
+            ida_kernwin.msg("[%s] Failed to apply signature '%s': %s\n" % (PLUGIN_NAME, signature, exc))
+
+    if new_name:
+        try:
+            ok = ida_name.set_name(func_ea, new_name, ida_name.SN_NOWARN | ida_name.SN_FORCE)
+            if not ok:
+                ida_kernwin.msg("[%s] Failed to rename function to '%s'.\n" % (PLUGIN_NAME, new_name))
+        except Exception as exc:
+            ida_kernwin.msg("[%s] Failed to rename function: %s\n" % (PLUGIN_NAME, exc))
+
+    if var_renames and ida_hexrays is not None:
+        try:
+            hexrays_ready = ida_hexrays.init_hexrays_plugin()
+        except Exception:
+            hexrays_ready = False
+        if hexrays_ready:
+            for old_name, new_name_var in var_renames:
+                try:
+                    if not ida_hexrays.rename_lvar(func_ea, old_name, new_name_var):
+                        ida_kernwin.msg(
+                            "[%s] Failed to rename variable '%s' -> '%s'.\n" % (PLUGIN_NAME, old_name, new_name_var)
+                        )
+                except Exception as exc:
+                    ida_kernwin.msg("[%s] Failed to rename variable '%s': %s\n" % (PLUGIN_NAME, old_name, exc))
+
     try:
         if ida_hexrays is not None and ida_hexrays.init_hexrays_plugin():
             ida_hexrays.mark_cfunc_dirty(func_ea)
@@ -282,6 +460,18 @@ class PluginConfig(object):
             self.max_callees = max(0, int(self.max_callees))
         except (TypeError, ValueError):
             self.max_callees = DEFAULT_CONFIG["max_callees"]
+        try:
+            self.follow_calls_depth = max(0, min(5, int(self.follow_calls_depth)))
+        except (TypeError, ValueError):
+            self.follow_calls_depth = DEFAULT_CONFIG["follow_calls_depth"]
+        try:
+            self.max_total_context_chars = max(self.max_context_chars, int(self.max_total_context_chars))
+        except (TypeError, ValueError):
+            self.max_total_context_chars = DEFAULT_CONFIG["max_total_context_chars"]
+        try:
+            self.max_auto_fetch = max(0, int(self.max_auto_fetch))
+        except (TypeError, ValueError):
+            self.max_auto_fetch = DEFAULT_CONFIG["max_auto_fetch"]
         self.model = (self.model or "").strip()
         self.api_key = (self.api_key or "").strip()
         self.system_prompt = self.system_prompt or DEFAULT_SYSTEM_PROMPT
@@ -300,11 +490,12 @@ class LlamaStreamWorker(threading.Thread):
     directly.
     """
 
-    def __init__(self, config, messages, on_delta, on_done, on_error):
+    def __init__(self, config, messages, on_delta, on_reasoning_delta, on_done, on_error):
         super().__init__(daemon=True)
         self._config = config
         self._messages = messages
         self._on_delta = on_delta
+        self._on_reasoning_delta = on_reasoning_delta
         self._on_done = on_done
         self._on_error = on_error
         self._cancel_event = threading.Event()
@@ -358,10 +549,12 @@ class LlamaStreamWorker(threading.Thread):
             raise RuntimeError("Cannot connect to %s (%s)" % (url, exc.reason)) from None
 
         parts = []
+        reasoning_parts = []
+        finish_reason = [None]
         with self._response as resp:
             content_type = resp.headers.get("Content-Type", "")
             if not content_type.startswith("text/event-stream"):
-                self._handle_non_stream_body(resp.read(), parts)
+                self._handle_non_stream_body(resp.read(), parts, reasoning_parts, finish_reason)
             else:
                 for raw_line in resp:
                     if self._cancel_event.is_set():
@@ -379,7 +572,18 @@ class LlamaStreamWorker(threading.Thread):
                     choices = obj.get("choices") or []
                     if not choices:
                         continue
-                    piece = (choices[0].get("delta") or {}).get("content")
+                    delta = choices[0].get("delta") or {}
+                    if choices[0].get("finish_reason"):
+                        finish_reason[0] = choices[0].get("finish_reason")
+                    # Reasoning/"thinking" models (e.g. Qwen3) stream their
+                    # chain-of-thought separately from the real answer.
+                    reasoning_piece = delta.get("reasoning_content")
+                    if reasoning_piece:
+                        reasoning_parts.append(reasoning_piece)
+                        ida_kernwin.execute_sync(
+                            functools.partial(self._on_reasoning_delta, reasoning_piece), ida_kernwin.MFF_FAST
+                        )
+                    piece = delta.get("content")
                     if piece:
                         parts.append(piece)
                         ida_kernwin.execute_sync(
@@ -388,10 +592,13 @@ class LlamaStreamWorker(threading.Thread):
 
         if not self._cancel_event.is_set():
             ida_kernwin.execute_sync(
-                functools.partial(self._on_done, "".join(parts)), ida_kernwin.MFF_FAST
+                functools.partial(
+                    self._on_done, "".join(parts), "".join(reasoning_parts), finish_reason[0]
+                ),
+                ida_kernwin.MFF_FAST,
             )
 
-    def _handle_non_stream_body(self, body, parts):
+    def _handle_non_stream_body(self, body, parts, reasoning_parts, finish_reason):
         try:
             obj = json.loads(body.decode("utf-8", "replace"))
         except Exception as exc:
@@ -400,7 +607,15 @@ class LlamaStreamWorker(threading.Thread):
         if not choices:
             err = obj.get("error")
             raise RuntimeError(str(err) if err else "Empty response from server.")
-        content = (choices[0].get("message") or {}).get("content", "")
+        finish_reason[0] = choices[0].get("finish_reason")
+        message = choices[0].get("message") or {}
+        reasoning = message.get("reasoning_content", "")
+        if reasoning:
+            reasoning_parts.append(reasoning)
+            ida_kernwin.execute_sync(
+                functools.partial(self._on_reasoning_delta, reasoning), ida_kernwin.MFF_FAST
+            )
+        content = message.get("content", "")
         if content:
             parts.append(content)
             ida_kernwin.execute_sync(
@@ -421,11 +636,20 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self.worker = None
         self.messages = None
         self._buffer = []
+        self._reasoning_buffer = []
+        self._reasoning_shown = False
         self._last_answer_text = ""
         self._closed = False
+        self._fetched_eas = set()
+        self._auto_fetch_rounds = 0
+        self._forced_final = False
+        self._suggested_name = None
+        self._suggested_signature = None
+        self._suggested_vars = []
+        self._root_is_pseudocode = False
 
         self.setWindowTitle("%s - %s @ %#x" % (PLUGIN_NAME, self.func_name, func.start_ea))
-        self.resize(560, 420)
+        self.resize(560, 520)
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -450,6 +674,34 @@ class ExplainResultDialog(QtWidgets.QDialog):
         followup_layout.addWidget(self.reason_button)
         layout.addLayout(followup_layout)
 
+        rename_layout = QtWidgets.QHBoxLayout()
+        self.rename_check = QtWidgets.QCheckBox("Rename function to:")
+        self.rename_check.setEnabled(False)
+        rename_layout.addWidget(self.rename_check)
+        self.rename_edit = QtWidgets.QLineEdit()
+        self.rename_edit.setEnabled(False)
+        rename_layout.addWidget(self.rename_edit, 1)
+        layout.addLayout(rename_layout)
+
+        signature_layout = QtWidgets.QHBoxLayout()
+        self.signature_check = QtWidgets.QCheckBox("Apply suggested signature:")
+        self.signature_check.setEnabled(False)
+        signature_layout.addWidget(self.signature_check)
+        self.signature_edit = QtWidgets.QLineEdit()
+        self.signature_edit.setEnabled(False)
+        signature_layout.addWidget(self.signature_edit, 1)
+        layout.addLayout(signature_layout)
+
+        varrename_layout = QtWidgets.QHBoxLayout()
+        self.varrename_check = QtWidgets.QCheckBox("Apply suggested variable renames:")
+        self.varrename_check.setEnabled(False)
+        varrename_layout.addWidget(self.varrename_check)
+        self.varrename_label = QtWidgets.QLineEdit()
+        self.varrename_label.setReadOnly(True)
+        self.varrename_label.setEnabled(False)
+        varrename_layout.addWidget(self.varrename_label, 1)
+        layout.addLayout(varrename_layout)
+
         button_layout = QtWidgets.QHBoxLayout()
         button_layout.addStretch(1)
         self.accept_button = QtWidgets.QPushButton("Accept && Add Comment")
@@ -467,12 +719,17 @@ class ExplainResultDialog(QtWidgets.QDialog):
 
     def _start_initial_request(self, func):
         try:
-            ctx = gather_function_context(func)
-            callees = gather_callees(func, self.config.max_callees) if self.config.include_callees else []
-            user_msg = build_user_message(self.config, func, ctx, callees)
+            blocks = gather_recursive_context(func, self.config)
+            callee_funcs = gather_callee_funcs(func, self.config.max_callees) if self.config.include_callees else []
+            callee_names = [
+                ida_funcs.get_func_name(f.start_ea) or ("sub_%X" % f.start_ea) for f in callee_funcs
+            ]
+            user_msg = build_user_message(self.config, func, blocks, callee_names)
         except Exception as exc:
             self.status_label.setText("Failed to gather function context: %s" % exc)
             return
+        self._fetched_eas = {ea for _, ea, _ in blocks}
+        self._root_is_pseudocode = bool(blocks) and blocks[0][2].kind == "pseudocode"
         self.messages = [
             {"role": "system", "content": self.config.system_prompt},
             {"role": "user", "content": user_msg},
@@ -481,43 +738,184 @@ class ExplainResultDialog(QtWidgets.QDialog):
 
     def start_request(self):
         self._buffer = []
+        self._reasoning_buffer = []
+        self._reasoning_shown = False
         self.status_label.setText("Querying model...")
         self.reason_button.setEnabled(False)
         self.followup_input.setEnabled(False)
         self.worker = LlamaStreamWorker(
-            self.config, list(self.messages), self._on_delta, self._on_done, self._on_error
+            self.config, list(self.messages), self._on_delta, self._on_reasoning_delta,
+            self._on_done, self._on_error
         )
         self.worker.start()
 
     # -- worker callbacks (run on IDA's main thread via execute_sync) -------
 
-    def _on_delta(self, piece):
-        if self._closed:
-            return 0
-        self._buffer.append(piece)
+    def _insert_styled(self, text, italic=False, color=None):
         try:
             cursor = self.stream_edit.textCursor()
             cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
-            cursor.insertText(piece)
+            fmt = QtGui.QTextCharFormat()
+            fmt.setFontItalic(italic)
+            if color is not None:
+                fmt.setForeground(color)
+            cursor.insertText(text, fmt)
             self.stream_edit.setTextCursor(cursor)
             self.stream_edit.ensureCursorVisible()
         except RuntimeError:
             pass
+
+    def _on_reasoning_delta(self, piece):
+        if self._closed:
+            return 0
+        self._reasoning_buffer.append(piece)
+        if not self._reasoning_shown:
+            self._reasoning_shown = True
+            self._insert_styled("[thinking] ", italic=True, color=QtGui.QColor("gray"))
+        self._insert_styled(piece, italic=True, color=QtGui.QColor("gray"))
         return 0
 
-    def _on_done(self, full_text):
+    def _on_delta(self, piece):
+        if self._closed:
+            return 0
+        if self._reasoning_shown:
+            self._reasoning_shown = False
+            self._insert_styled("\n\n")
+        self._buffer.append(piece)
+        self._insert_styled(piece)
+        return 0
+
+    def _on_done(self, full_text, reasoning_text="", finish_reason=None):
         if self._closed:
             return 0
         text = full_text if full_text else "".join(self._buffer)
-        self._last_answer_text = text
+        reasoning = reasoning_text if reasoning_text else "".join(self._reasoning_buffer)
+
+        if not text.strip():
+            # Nothing usable came back - don't pollute the conversation history
+            # with an empty assistant turn, just explain what happened.
+            if reasoning.strip():
+                self.status_label.setText(
+                    "Model spent its whole token budget on reasoning and gave no "
+                    "answer (finish_reason=%s). Increase 'Max tokens' in Settings, "
+                    "or click Reason More to ask it to wrap up." % (finish_reason or "unknown")
+                )
+            else:
+                self.status_label.setText(
+                    "Model returned an empty response (finish_reason=%s)." % (finish_reason or "unknown")
+                )
+            self.reason_button.setEnabled(True)
+            self.followup_input.setEnabled(True)
+            self.accept_button.setEnabled(False)
+            self.worker = None
+            return 0
+
         if self.messages is not None:
             self.messages.append({"role": "assistant", "content": text})
+
+        requests = _REQUEST_CODE_RE.findall(text)
+        if requests and not self._forced_final:
+            if self._auto_fetch_rounds < self.config.max_auto_fetch:
+                self._auto_fetch_rounds += 1
+                self._handle_code_requests(requests)
+                return 0
+            self._forced_final = True
+            self.messages.append({
+                "role": "user",
+                "content": (
+                    "You have reached the maximum number of code requests (%d). "
+                    "Please give your best explanation now based on the "
+                    "information already gathered, without requesting further "
+                    "code." % self.config.max_auto_fetch
+                ),
+            })
+            self.status_label.setText("Auto-fetch limit reached; asking for a final answer...")
+            self.start_request()
+            return 0
+
+        name_matches = _SUGGESTED_NAME_RE.findall(text)
+        if name_matches:
+            text = _SUGGESTED_NAME_RE.sub("", text).strip()
+            candidate = sanitize_suggested_name(name_matches[-1])
+            if candidate:
+                self._suggested_name = candidate
+                self.rename_edit.setText(candidate)
+                self.rename_check.setEnabled(True)
+                self.rename_edit.setEnabled(True)
+                self.rename_check.setChecked(is_auto_generated_name(self.func_name))
+
+        sig_matches = _SUGGESTED_SIGNATURE_RE.findall(text)
+        if sig_matches:
+            text = _SUGGESTED_SIGNATURE_RE.sub("", text).strip()
+            candidate = sig_matches[-1].strip()
+            if candidate and self._root_is_pseudocode:
+                self._suggested_signature = candidate
+                self.signature_edit.setText(candidate)
+                self.signature_check.setEnabled(True)
+                self.signature_edit.setEnabled(True)
+                self.signature_check.setChecked(True)
+
+        var_matches = _SUGGESTED_VAR_RE.findall(text)
+        if var_matches:
+            text = _SUGGESTED_VAR_RE.sub("", text).strip()
+            if self._root_is_pseudocode:
+                pairs = []
+                seen_old = set()
+                for old_name, new_name_var in var_matches:
+                    if old_name != new_name_var and old_name not in seen_old:
+                        seen_old.add(old_name)
+                        pairs.append((old_name, new_name_var))
+                if pairs:
+                    self._suggested_vars = pairs
+                    self.varrename_label.setText(", ".join("%s -> %s" % p for p in pairs))
+                    self.varrename_check.setEnabled(True)
+                    self.varrename_label.setEnabled(True)
+                    self.varrename_check.setChecked(True)
+
+        self._last_answer_text = text
         self.status_label.setText("Done.")
         self.reason_button.setEnabled(True)
         self.followup_input.setEnabled(True)
         self.accept_button.setEnabled(bool(text.strip()))
         self.worker = None
         return 0
+
+    def _handle_code_requests(self, requests):
+        self.status_label.setText("Model requested more code, fetching...")
+        reply_parts = []
+        queried = []
+        seen_this_round = set()
+        for query in requests:
+            query = query.strip()
+            if not query or query in seen_this_round:
+                continue
+            seen_this_round.add(query)
+            queried.append(query)
+            func = resolve_function_query(query)
+            if func is None:
+                reply_parts.append("No function found matching '%s'." % query)
+                continue
+            if func.start_ea in self._fetched_eas:
+                name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
+                reply_parts.append("You already have the code for %s (see above)." % name)
+                continue
+            try:
+                ctx = gather_function_context(func)
+            except Exception as exc:
+                reply_parts.append("Failed to retrieve code for '%s': %s" % (query, exc))
+                continue
+            self._fetched_eas.add(func.start_ea)
+            reply_parts.append(format_function_block("Requested function", func.start_ea, ctx, self.config))
+
+        reply_text = "\n\n".join(reply_parts) if reply_parts else "No additional code available."
+        self.messages.append({"role": "user", "content": reply_text})
+        try:
+            self.stream_edit.appendPlainText(
+                "\n\n--- Fetching requested code (%s) ---\n" % ", ".join(queried)
+            )
+        except RuntimeError:
+            pass
+        self.start_request()
 
     def _on_error(self, message):
         if self._closed:
@@ -540,6 +938,7 @@ class ExplainResultDialog(QtWidgets.QDialog):
             followup = "Please explain your reasoning in more detail."
         self.messages.append({"role": "user", "content": followup})
         self.followup_input.clear()
+        self._forced_final = False
         try:
             self.stream_edit.appendPlainText("\n\n--- Follow-up: %s ---\n" % followup)
         except RuntimeError:
@@ -552,8 +951,29 @@ class ExplainResultDialog(QtWidgets.QDialog):
             ida_kernwin.warning("Nothing to accept yet.")
             return
         comment = strip_markdown_fences(text)
+        comment = _REQUEST_CODE_RE.sub("", comment)
+        comment = _SUGGESTED_NAME_RE.sub("", comment)
+        comment = _SUGGESTED_SIGNATURE_RE.sub("", comment)
+        comment = _SUGGESTED_VAR_RE.sub("", comment).strip()
+
+        new_name = None
+        if self.rename_check.isChecked():
+            new_name = sanitize_suggested_name(self.rename_edit.text())
+            if not new_name:
+                ida_kernwin.warning(
+                    "'%s' is not a valid function name; skipping rename." % self.rename_edit.text()
+                )
+
+        signature = None
+        if self.signature_check.isChecked() and self.signature_edit.text().strip():
+            signature = self.signature_edit.text().strip()
+
+        var_renames = list(self._suggested_vars) if (self.varrename_check.isChecked() and self._suggested_vars) else None
+
         ida_kernwin.execute_sync(
-            functools.partial(_write_comment_and_refresh, self.func_ea, comment),
+            functools.partial(
+                _apply_suggestions_and_refresh, self.func_ea, comment, new_name, signature, var_renames
+            ),
             ida_kernwin.MFF_WRITE,
         )
         self.close()
@@ -579,14 +999,14 @@ class SettingsDialog(QtWidgets.QDialog):
 
         form = QtWidgets.QFormLayout()
 
-        self.base_url_edit = QtWidgets.QLineEdit(config.base_url)
+        self.base_url_edit = QtWidgets.QLineEdit()
         form.addRow("Server base URL:", self.base_url_edit)
 
-        self.model_edit = QtWidgets.QLineEdit(config.model)
+        self.model_edit = QtWidgets.QLineEdit()
         self.model_edit.setPlaceholderText("(optional - leave blank to use server default)")
         form.addRow("Model name:", self.model_edit)
 
-        self.api_key_edit = QtWidgets.QLineEdit(config.api_key)
+        self.api_key_edit = QtWidgets.QLineEdit()
         self.api_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.api_key_edit.setPlaceholderText("(optional bearer token)")
         form.addRow("API key:", self.api_key_edit)
@@ -594,52 +1014,113 @@ class SettingsDialog(QtWidgets.QDialog):
         self.temperature_spin = QtWidgets.QDoubleSpinBox()
         self.temperature_spin.setRange(0.0, 2.0)
         self.temperature_spin.setSingleStep(0.1)
-        self.temperature_spin.setValue(config.temperature)
         form.addRow("Temperature:", self.temperature_spin)
 
         self.max_tokens_spin = QtWidgets.QSpinBox()
-        self.max_tokens_spin.setRange(1, 32768)
-        self.max_tokens_spin.setValue(config.max_tokens)
+        self.max_tokens_spin.setRange(1, 262144)
+        self.max_tokens_spin.setToolTip(
+            "Reasoning/thinking models can spend thousands of tokens on "
+            "chain-of-thought before producing a real answer - keep this "
+            "generous, well below the server's context size."
+        )
         form.addRow("Max tokens:", self.max_tokens_spin)
 
         self.timeout_spin = QtWidgets.QSpinBox()
-        self.timeout_spin.setRange(1, 600)
-        self.timeout_spin.setValue(config.request_timeout)
+        self.timeout_spin.setRange(1, 3600)
+        self.timeout_spin.setToolTip(
+            "This is a per-chunk socket timeout, not a total-generation cap - "
+            "it mainly needs headroom for slow prompt processing or a stalled "
+            "gap between streamed tokens on local/CPU inference."
+        )
         form.addRow("Request timeout (s):", self.timeout_spin)
 
         self.max_context_spin = QtWidgets.QSpinBox()
         self.max_context_spin.setRange(500, 200000)
         self.max_context_spin.setSingleStep(500)
-        self.max_context_spin.setValue(config.max_context_chars)
         form.addRow("Max context chars:", self.max_context_spin)
 
         self.include_callees_check = QtWidgets.QCheckBox("Include called-function names in prompt")
-        self.include_callees_check.setChecked(config.include_callees)
         form.addRow(self.include_callees_check)
 
         self.max_callees_spin = QtWidgets.QSpinBox()
         self.max_callees_spin.setRange(0, 200)
-        self.max_callees_spin.setValue(config.max_callees)
         form.addRow("Max callees listed:", self.max_callees_spin)
 
-        self.hotkey_edit = QtWidgets.QLineEdit(config.explain_hotkey)
+        self.follow_calls_spin = QtWidgets.QSpinBox()
+        self.follow_calls_spin.setRange(0, 5)
+        self.follow_calls_spin.setToolTip(
+            "0 = only the target function. N>0 eagerly includes the code of "
+            "called functions up to N levels deep in the initial prompt."
+        )
+        form.addRow("Follow calls depth:", self.follow_calls_spin)
+
+        self.max_total_context_spin = QtWidgets.QSpinBox()
+        self.max_total_context_spin.setRange(1000, 1000000)
+        self.max_total_context_spin.setSingleStep(1000)
+        self.max_total_context_spin.setToolTip(
+            "Overall char budget across the target function plus all "
+            "eagerly-followed called functions combined."
+        )
+        form.addRow("Max total context chars:", self.max_total_context_spin)
+
+        self.max_auto_fetch_spin = QtWidgets.QSpinBox()
+        self.max_auto_fetch_spin.setRange(0, 50)
+        self.max_auto_fetch_spin.setToolTip(
+            "Max number of automatic REQUEST_CODE round-trips the model may "
+            "make per conversation before being asked for a final answer."
+        )
+        form.addRow("Max on-demand code requests:", self.max_auto_fetch_spin)
+
+        self.hotkey_edit = QtWidgets.QLineEdit()
         self.hotkey_edit.setPlaceholderText("e.g. Ctrl-Alt-E (leave blank for none)")
         form.addRow("Explain hotkey:", self.hotkey_edit)
 
-        self.system_prompt_edit = QtWidgets.QPlainTextEdit(config.system_prompt)
+        self.system_prompt_edit = QtWidgets.QPlainTextEdit()
         self.system_prompt_edit.setMinimumHeight(140)
         form.addRow("System prompt:", self.system_prompt_edit)
 
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+            | QtWidgets.QDialogButtonBox.StandardButton.RestoreDefaults
         )
         buttons.accepted.connect(self._on_ok)
         buttons.rejected.connect(self.reject)
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(
+            self._on_restore_defaults
+        )
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.addLayout(form)
         outer.addWidget(buttons)
+
+        self._populate(config)
+
+    def _populate(self, config):
+        self.base_url_edit.setText(config.base_url)
+        self.model_edit.setText(config.model)
+        self.api_key_edit.setText(config.api_key)
+        self.temperature_spin.setValue(config.temperature)
+        self.max_tokens_spin.setValue(config.max_tokens)
+        self.timeout_spin.setValue(config.request_timeout)
+        self.max_context_spin.setValue(config.max_context_chars)
+        self.include_callees_check.setChecked(config.include_callees)
+        self.max_callees_spin.setValue(config.max_callees)
+        self.follow_calls_spin.setValue(config.follow_calls_depth)
+        self.max_total_context_spin.setValue(config.max_total_context_chars)
+        self.max_auto_fetch_spin.setValue(config.max_auto_fetch)
+        self.hotkey_edit.setText(config.explain_hotkey)
+        self.system_prompt_edit.setPlainText(config.system_prompt)
+
+    def _on_restore_defaults(self):
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Restore Defaults",
+            "Reset all settings on this screen to their default values?\n"
+            "Nothing is saved until you click OK.",
+        )
+        if answer == QtWidgets.QMessageBox.StandardButton.Yes:
+            self._populate(PluginConfig())
 
     def _on_ok(self):
         cfg = self._base_config.clone()
@@ -652,6 +1133,9 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.max_context_chars = self.max_context_spin.value()
         cfg.include_callees = self.include_callees_check.isChecked()
         cfg.max_callees = self.max_callees_spin.value()
+        cfg.follow_calls_depth = self.follow_calls_spin.value()
+        cfg.max_total_context_chars = self.max_total_context_spin.value()
+        cfg.max_auto_fetch = self.max_auto_fetch_spin.value()
         cfg.explain_hotkey = self.hotkey_edit.text().strip()
         cfg.system_prompt = self.system_prompt_edit.toPlainText()
         cfg._validate()
