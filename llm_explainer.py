@@ -151,7 +151,19 @@ DEFAULT_SYSTEM_PROMPT = (
     "Only propose types or variable names you are reasonably confident "
     "about from the code itself; skip anything uncertain. Omit both kinds "
     "of lines entirely when you were given plain disassembly instead of "
-    "pseudocode, or when you have nothing confident to suggest."
+    "pseudocode, or when you have nothing confident to suggest.\n\n"
+    "If, while investigating, you actually examined the code of a CALLED "
+    "function (because its code was included up front, or you requested it "
+    "with REQUEST_CODE) and its current name still looks auto-generated "
+    "(e.g. sub_1402346D0, sub_401000, loc_403010), you may also suggest "
+    "renaming it - but only that function, and only if you are confident "
+    "about what it does from the code you actually saw, never from its "
+    "name alone or a guess. Add one line per such function of the exact "
+    "form\n"
+    "SUGGESTED_CALLEE_NAME: <its current name or address> -> <new name>\n"
+    "using the same valid-C-identifier rules as SUGGESTED_NAME. Do not use "
+    "this for the target function itself (use SUGGESTED_NAME for that), "
+    "and do not use it for a called function whose code you never saw."
 )
 
 DEFAULT_CONFIG = {
@@ -186,6 +198,9 @@ _REQUEST_CODE_RE = re.compile(r"(?im)^\s*REQUEST_CODE:\s*(.+?)\s*$")
 _SUGGESTED_NAME_RE = re.compile(r"(?im)^\s*SUGGESTED_NAME:\s*(.+?)\s*$")
 _SUGGESTED_SIGNATURE_RE = re.compile(r"(?im)^\s*SUGGESTED_SIGNATURE:\s*(.+?)\s*$")
 _SUGGESTED_VAR_RE = re.compile(r"(?im)^\s*SUGGESTED_VAR:\s*([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*)\s*$")
+_SUGGESTED_CALLEE_NAME_RE = re.compile(
+    r"(?im)^\s*SUGGESTED_CALLEE_NAME:\s*(.+?)\s*->\s*([A-Za-z_]\w*)\s*$"
+)
 _VALID_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 _AUTO_NAME_RE = re.compile(r"^(sub|loc|nullsub|j_sub|j_nullsub)_[0-9A-Fa-f]+$")
 
@@ -437,7 +452,62 @@ def _resolve_func(ctx):
     return ida_funcs.get_func(ea)
 
 
-def _apply_suggestions_and_refresh(func_ea, comment, new_name=None, signature=None, var_renames=None):
+def _rename_lvars(func_ea, var_renames):
+    """Rename local variables BEFORE any signature/type change is applied
+    to the same function: retyping a function (e.g. via idc.SetType) can
+    change how Hex-Rays decomposes its local variables, which would make
+    the variable names the model actually saw (and is renaming) stale by
+    the time we get to them - this was the main suspected cause of renames
+    being silently skipped. Also validates the old name actually exists in
+    the current decompilation (with a case-insensitive fallback) instead of
+    just trying the exact name blind, and logs a clearer reason on failure.
+    """
+    if not var_renames or ida_hexrays is None:
+        return
+    try:
+        hexrays_ready = ida_hexrays.init_hexrays_plugin()
+    except Exception:
+        hexrays_ready = False
+    if not hexrays_ready:
+        return
+
+    lvar_names = None
+    try:
+        cfunc = ida_hexrays.decompile(func_ea)
+        if cfunc is not None:
+            lvar_names = {lv.name for lv in cfunc.get_lvars() if lv.name}
+    except Exception:
+        lvar_names = None
+
+    for old_name, new_name_var in var_renames:
+        actual_old_name = old_name
+        if lvar_names is not None and old_name not in lvar_names:
+            ci_match = next((n for n in lvar_names if n.lower() == old_name.lower()), None)
+            if ci_match:
+                actual_old_name = ci_match
+            else:
+                ida_kernwin.msg(
+                    "[%s] Skipping variable rename '%s' -> '%s': no such "
+                    "variable in the current decompilation.\n"
+                    % (PLUGIN_NAME, old_name, new_name_var)
+                )
+                continue
+        try:
+            ok = ida_hexrays.rename_lvar(func_ea, actual_old_name, new_name_var)
+        except Exception as exc:
+            ok = False
+            ida_kernwin.msg("[%s] Failed to rename variable '%s': %s\n" % (PLUGIN_NAME, actual_old_name, exc))
+        if not ok:
+            ida_kernwin.msg(
+                "[%s] Failed to rename variable '%s' -> '%s'.\n" % (PLUGIN_NAME, actual_old_name, new_name_var)
+            )
+
+
+def _apply_suggestions_and_refresh(
+    func_ea, comment, new_name=None, signature=None, var_renames=None, callee_renames=None
+):
+    _rename_lvars(func_ea, var_renames)
+
     try:
         idc.set_func_cmt(func_ea, comment, 0)
     except Exception as exc:
@@ -461,20 +531,21 @@ def _apply_suggestions_and_refresh(func_ea, comment, new_name=None, signature=No
         except Exception as exc:
             ida_kernwin.msg("[%s] Failed to rename function: %s\n" % (PLUGIN_NAME, exc))
 
-    if var_renames and ida_hexrays is not None:
-        try:
-            hexrays_ready = ida_hexrays.init_hexrays_plugin()
-        except Exception:
-            hexrays_ready = False
-        if hexrays_ready:
-            for old_name, new_name_var in var_renames:
-                try:
-                    if not ida_hexrays.rename_lvar(func_ea, old_name, new_name_var):
-                        ida_kernwin.msg(
-                            "[%s] Failed to rename variable '%s' -> '%s'.\n" % (PLUGIN_NAME, old_name, new_name_var)
-                        )
-                except Exception as exc:
-                    ida_kernwin.msg("[%s] Failed to rename variable '%s': %s\n" % (PLUGIN_NAME, old_name, exc))
+    if callee_renames:
+        for callee_ea, callee_new_name in callee_renames:
+            try:
+                ok = ida_name.set_name(callee_ea, callee_new_name, ida_name.SN_NOWARN | ida_name.SN_FORCE)
+                if not ok:
+                    ida_kernwin.msg(
+                        "[%s] Failed to rename called function to '%s'.\n" % (PLUGIN_NAME, callee_new_name)
+                    )
+                elif ida_hexrays is not None and ida_hexrays.init_hexrays_plugin():
+                    try:
+                        ida_hexrays.mark_cfunc_dirty(callee_ea)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                ida_kernwin.msg("[%s] Failed to rename called function: %s\n" % (PLUGIN_NAME, exc))
 
     try:
         if ida_hexrays is not None and ida_hexrays.init_hexrays_plugin():
@@ -743,7 +814,7 @@ class LlamaStreamWorker(threading.Thread):
 
 ConversationResult = namedtuple("ConversationResult", [
     "text", "reasoning_text", "suggested_name", "suggested_signature",
-    "suggested_vars", "root_is_pseudocode", "error",
+    "suggested_vars", "suggested_callee_renames", "root_is_pseudocode", "error",
 ])
 
 
@@ -850,7 +921,7 @@ class ConversationRunner(object):
                 msg = "Model returned an empty response (finish_reason=%s)." % (finish_reason or "unknown")
             self._on_result_cb(ConversationResult(
                 text="", reasoning_text=reasoning_text, suggested_name=None,
-                suggested_signature=None, suggested_vars=[],
+                suggested_signature=None, suggested_vars=[], suggested_callee_renames=[],
                 root_is_pseudocode=self._root_is_pseudocode, error=msg,
             ))
             return 0
@@ -903,12 +974,40 @@ class ConversationRunner(object):
                         seen_old.add(old_name)
                         suggested_vars.append((old_name, new_name_var))
 
+        suggested_callee_renames = []
+        callee_matches = _SUGGESTED_CALLEE_NAME_RE.findall(text)
+        if callee_matches:
+            text = _SUGGESTED_CALLEE_NAME_RE.sub("", text).strip()
+            seen_callee_eas = set()
+            for query, callee_new_name_raw in callee_matches:
+                callee_new_name = sanitize_suggested_name(callee_new_name_raw)
+                if not callee_new_name:
+                    continue
+                callee_func = resolve_function_query(query.strip())
+                if callee_func is None:
+                    continue
+                callee_ea = callee_func.start_ea
+                if callee_ea == self.func_ea or callee_ea in seen_callee_eas:
+                    continue
+                # Only allow renaming functions whose code the model actually
+                # saw (eagerly included or fetched via REQUEST_CODE this
+                # conversation), and only when still under a default name -
+                # never overwrite a name a human already gave it.
+                if callee_ea not in self._fetched_eas:
+                    continue
+                current_callee_name = ida_funcs.get_func_name(callee_ea) or ("sub_%X" % callee_ea)
+                if not is_auto_generated_name(current_callee_name):
+                    continue
+                seen_callee_eas.add(callee_ea)
+                suggested_callee_renames.append((callee_ea, callee_new_name))
+
         text = strip_markdown_fences(_REQUEST_CODE_RE.sub("", text).strip())
 
         self._on_result_cb(ConversationResult(
             text=text, reasoning_text=reasoning_text,
             suggested_name=suggested_name, suggested_signature=suggested_signature,
-            suggested_vars=suggested_vars, root_is_pseudocode=self._root_is_pseudocode,
+            suggested_vars=suggested_vars, suggested_callee_renames=suggested_callee_renames,
+            root_is_pseudocode=self._root_is_pseudocode,
             error=None,
         ))
         return 0
@@ -960,9 +1059,10 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self._last_answer_text = ""
         self._closed = False
         self._suggested_vars = []
+        self._suggested_callee_renames = []
 
         self.setWindowTitle("%s - %s @ %#x" % (PLUGIN_NAME, self.func_name, func.start_ea))
-        self.resize(560, 520)
+        self.resize(560, 560)
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -1014,6 +1114,16 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self.varrename_label.setEnabled(False)
         varrename_layout.addWidget(self.varrename_label, 1)
         layout.addLayout(varrename_layout)
+
+        calleerename_layout = QtWidgets.QHBoxLayout()
+        self.calleerename_check = QtWidgets.QCheckBox("Rename called function(s) with default names:")
+        self.calleerename_check.setEnabled(False)
+        calleerename_layout.addWidget(self.calleerename_check)
+        self.calleerename_label = QtWidgets.QLineEdit()
+        self.calleerename_label.setReadOnly(True)
+        self.calleerename_label.setEnabled(False)
+        calleerename_layout.addWidget(self.calleerename_label, 1)
+        layout.addLayout(calleerename_layout)
 
         button_layout = QtWidgets.QHBoxLayout()
         button_layout.addStretch(1)
@@ -1122,6 +1232,17 @@ class ExplainResultDialog(QtWidgets.QDialog):
             self.varrename_label.setEnabled(True)
             self.varrename_check.setChecked(True)
 
+        if result.suggested_callee_renames:
+            self._suggested_callee_renames = result.suggested_callee_renames
+            labels = []
+            for callee_ea, callee_new_name in result.suggested_callee_renames:
+                old_callee_name = ida_funcs.get_func_name(callee_ea) or ("sub_%X" % callee_ea)
+                labels.append("%s -> %s" % (old_callee_name, callee_new_name))
+            self.calleerename_label.setText(", ".join(labels))
+            self.calleerename_check.setEnabled(True)
+            self.calleerename_label.setEnabled(True)
+            self.calleerename_check.setChecked(True)
+
         self._last_answer_text = result.text
         self.status_label.setText("Done.")
         self.reason_button.setEnabled(True)
@@ -1167,7 +1288,8 @@ class ExplainResultDialog(QtWidgets.QDialog):
         comment = _REQUEST_CODE_RE.sub("", comment)
         comment = _SUGGESTED_NAME_RE.sub("", comment)
         comment = _SUGGESTED_SIGNATURE_RE.sub("", comment)
-        comment = _SUGGESTED_VAR_RE.sub("", comment).strip()
+        comment = _SUGGESTED_VAR_RE.sub("", comment)
+        comment = _SUGGESTED_CALLEE_NAME_RE.sub("", comment).strip()
 
         new_name = None
         if self.rename_check.isChecked():
@@ -1182,10 +1304,15 @@ class ExplainResultDialog(QtWidgets.QDialog):
             signature = self.signature_edit.text().strip()
 
         var_renames = list(self._suggested_vars) if (self.varrename_check.isChecked() and self._suggested_vars) else None
+        callee_renames = (
+            list(self._suggested_callee_renames)
+            if (self.calleerename_check.isChecked() and self._suggested_callee_renames) else None
+        )
 
         ida_kernwin.execute_sync(
             functools.partial(
-                _apply_suggestions_and_refresh, self.func_ea, comment, new_name, signature, var_renames
+                _apply_suggestions_and_refresh, self.func_ea, comment, new_name, signature,
+                var_renames, callee_renames,
             ),
             ida_kernwin.MFF_WRITE,
         )
@@ -1476,7 +1603,8 @@ class BatchPickerDialog(QtWidgets.QDialog):
 
 BatchItemResult = namedtuple("BatchItemResult", [
     "func_ea", "orig_name", "ok", "message", "comment",
-    "suggested_name", "suggested_signature", "suggested_vars", "root_is_pseudocode",
+    "suggested_name", "suggested_signature", "suggested_vars",
+    "suggested_callee_renames", "root_is_pseudocode",
 ])
 
 
@@ -1553,29 +1681,31 @@ class BatchController(object):
         orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
         if result.error:
             item = BatchItemResult(func.start_ea, orig_name, False, result.error,
-                                    None, None, None, [], result.root_is_pseudocode)
+                                    None, None, None, [], [], result.root_is_pseudocode)
             self._on_row_update(index, "Error", result.error)
         else:
             item = BatchItemResult(func.start_ea, orig_name, True, None, result.text,
                                     result.suggested_name, result.suggested_signature,
-                                    result.suggested_vars, result.root_is_pseudocode)
+                                    result.suggested_vars, result.suggested_callee_renames,
+                                    result.root_is_pseudocode)
             self._on_row_update(index, "Done", result.text[:120])
         self._record_and_advance(item)
 
     def _on_error(self, index, func, message):
         orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
         item = BatchItemResult(func.start_ea, orig_name, False, message,
-                                None, None, None, [], False)
+                                None, None, None, [], [], False)
         self._on_row_update(index, "Error", message)
         self._record_and_advance(item)
 
 
 def _apply_batch_and_refresh(items):
-    """items: list of (func_ea, comment, new_name, signature, var_renames).
-    One execute_sync/MFF_WRITE round-trip for the whole batch instead of N.
+    """items: list of (func_ea, comment, new_name, signature, var_renames,
+    callee_renames). One execute_sync/MFF_WRITE round-trip for the whole
+    batch instead of N.
     """
-    for func_ea, comment, new_name, signature, var_renames in items:
-        _apply_suggestions_and_refresh(func_ea, comment, new_name, signature, var_renames)
+    for func_ea, comment, new_name, signature, var_renames, callee_renames in items:
+        _apply_suggestions_and_refresh(func_ea, comment, new_name, signature, var_renames, callee_renames)
     return 1
 
 
@@ -1664,7 +1794,10 @@ class BatchProgressDialog(QtWidgets.QDialog):
                 new_name = item.suggested_name
             signature = item.suggested_signature if item.root_is_pseudocode else None
             var_renames = item.suggested_vars if (item.root_is_pseudocode and item.suggested_vars) else None
-            items_to_apply.append((item.func_ea, item.comment, new_name, signature, var_renames))
+            callee_renames = item.suggested_callee_renames or None
+            items_to_apply.append(
+                (item.func_ea, item.comment, new_name, signature, var_renames, callee_renames)
+            )
         if not items_to_apply:
             return
         ida_kernwin.execute_sync(
