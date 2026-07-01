@@ -36,6 +36,11 @@ Edit > Plugins > LLM Explainer.
 Note: if llama-server is run with a single inference slot, opening several
 "explain" dialogs at once will simply queue their requests on the server -
 that is a server/deployment concern, not a bug in this plugin.
+
+To process many functions at once, right-click in the Functions window (or
+use Edit > Plugins > Batch Explain Functions...) to pick a set of functions,
+process them sequentially, and review/apply the results in one batch -
+still nothing is written to the database until you explicitly apply.
 """
 
 import functools
@@ -71,14 +76,17 @@ from PySide6 import QtCore, QtGui, QtWidgets
 PLUGIN_NAME = "LLM Explainer"
 PLUGIN_VERSION = "1.0.0"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
+ACTION_ID_BATCH = "llm_explainer:batch_explain"
 CONFIG_FILENAME = "llm_explainer.cfg.json"
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert reverse engineer assisting inside IDA Pro. You will "
     "be given the decompiled pseudocode or disassembly of a target function, "
     "along with its name, address, target architecture, the names of "
-    "functions it calls, and - depending on settings - the code of some "
-    "called functions already included below the target function.\n\n"
+    "functions it calls, notable string literals and named global data it "
+    "references (when available), and - depending on settings - the code "
+    "of some called functions already included below the target "
+    "function.\n\n"
     "If understanding the target function requires seeing the code of a "
     "called function that was NOT already included, you may request it: "
     "reply with one or more lines of the exact form\n"
@@ -137,6 +145,9 @@ DEFAULT_CONFIG = {
     "follow_calls_depth": 0,
     "max_total_context_chars": 40000,
     "max_auto_fetch": 5,
+    "include_data_refs": True,
+    "max_data_refs": 20,
+    "max_string_len": 150,
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "explain_hotkey": "Ctrl-Alt-E",
 }
@@ -238,6 +249,74 @@ def gather_callee_funcs(func, max_callees):
     return result[:max_callees]
 
 
+DataRef = namedtuple("DataRef", ["ea", "kind", "text"])  # kind: "string" | "global"
+
+
+def gather_data_refs(func, max_refs, max_string_len):
+    """String literals + named globals referenced by func's instructions
+    (root function only, mirrors how "Calls:" is root-only). Skips refs
+    that are themselves function entry points (already covered by
+    gather_callee_funcs/"Calls:"). Dedupes by address, first-seen order,
+    capped at max_refs. Defensive: one bad ref must never abort the rest.
+    """
+    if max_refs <= 0:
+        return []
+    result = []
+    seen = set()
+    for ea in idautils.FuncItems(func.start_ea):
+        try:
+            refs = list(idautils.DataRefsFrom(ea))
+        except Exception:
+            continue
+        for ref in refs:
+            if ref in seen:
+                continue
+            seen.add(ref)
+            try:
+                callee = ida_funcs.get_func(ref)
+                if callee is not None and callee.start_ea == ref:
+                    continue
+            except Exception:
+                pass
+            try:
+                strtype = idc.get_str_type(ref)
+            except Exception:
+                strtype = None
+            if strtype is not None:
+                try:
+                    raw = idc.get_strlit_contents(ref, -1, strtype)
+                    text = (raw or b"").decode("utf-8", "replace")
+                except Exception:
+                    continue
+                if not text:
+                    continue
+                text = text.replace("\r", "\\r").replace("\n", "\\n")
+                if len(text) > max_string_len:
+                    text = text[:max_string_len] + "...[truncated]"
+                result.append(DataRef(ea=ref, kind="string", text=text))
+            else:
+                try:
+                    name = idc.get_name(ref)
+                except Exception:
+                    name = None
+                if name:
+                    result.append(DataRef(ea=ref, kind="global", text=name))
+            if len(result) >= max_refs:
+                return result
+    return result
+
+
+def format_data_refs_section(data_refs):
+    strings = [r.text for r in data_refs if r.kind == "string"]
+    names = [r.text for r in data_refs if r.kind == "global"]
+    lines = []
+    if strings:
+        lines.append("Strings referenced: " + "; ".join('"%s"' % s for s in strings))
+    if names:
+        lines.append("Globals referenced: " + ", ".join(names))
+    return "\n".join(lines)
+
+
 def format_function_block(label, func_ea, ctx, config):
     name = ida_funcs.get_func_name(func_ea) or ("sub_%X" % func_ea)
     body = ctx.text
@@ -304,7 +383,7 @@ def resolve_function_query(query):
     return ida_funcs.get_func(ea)
 
 
-def build_user_message(config, func, blocks, callee_names):
+def build_user_message(config, func, blocks, callee_names, data_refs=None):
     name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
     header = (
         "Function: %s\n"
@@ -313,6 +392,10 @@ def build_user_message(config, func, blocks, callee_names):
     )
     if callee_names:
         header += "Calls: %s\n" % ", ".join(callee_names)
+    if data_refs:
+        section = format_data_refs_section(data_refs)
+        if section:
+            header += section + "\n"
     if config.follow_calls_depth > 0:
         header += (
             "Code for up to %d level(s) of called functions is included "
@@ -472,6 +555,15 @@ class PluginConfig(object):
             self.max_auto_fetch = max(0, int(self.max_auto_fetch))
         except (TypeError, ValueError):
             self.max_auto_fetch = DEFAULT_CONFIG["max_auto_fetch"]
+        self.include_data_refs = bool(self.include_data_refs)
+        try:
+            self.max_data_refs = max(0, int(self.max_data_refs))
+        except (TypeError, ValueError):
+            self.max_data_refs = DEFAULT_CONFIG["max_data_refs"]
+        try:
+            self.max_string_len = max(20, min(2000, int(self.max_string_len)))
+        except (TypeError, ValueError):
+            self.max_string_len = DEFAULT_CONFIG["max_string_len"]
         self.model = (self.model or "").strip()
         self.api_key = (self.api_key or "").strip()
         self.system_prompt = self.system_prompt or DEFAULT_SYSTEM_PROMPT
@@ -624,6 +716,213 @@ class LlamaStreamWorker(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
+# Conversation driver (no Qt/DB writes - safe for interactive and batch use)
+# ---------------------------------------------------------------------------
+
+ConversationResult = namedtuple("ConversationResult", [
+    "text", "reasoning_text", "suggested_name", "suggested_signature",
+    "suggested_vars", "root_is_pseudocode", "error",
+])
+
+
+class ConversationRunner(object):
+    """Owns ONE function's explain conversation end-to-end: builds the
+    initial prompt, drives LlamaStreamWorker request/response cycles
+    (including the REQUEST_CODE auto-fetch loop), and extracts the
+    SUGGESTED_* markers from the final answer. Only network I/O (via
+    LlamaStreamWorker) and read-only IDA API calls happen here - no Qt
+    widgets and no database writes - so the same instance/logic can drive
+    either the interactive ExplainResultDialog (live streaming) or a
+    headless batch controller (call start(), wait for on_result).
+    """
+
+    def __init__(self, config, func, on_delta=None, on_reasoning_delta=None, on_status=None):
+        self.config = config
+        self.func = func
+        self.func_ea = func.start_ea
+        self.messages = None
+        self._on_delta = on_delta or (lambda piece: None)
+        self._on_reasoning_delta = on_reasoning_delta or (lambda piece: None)
+        self._on_status = on_status or (lambda text: None)
+        self._fetched_eas = set()
+        self._auto_fetch_rounds = 0
+        self._forced_final = False
+        self._root_is_pseudocode = False
+        self.worker = None
+        self._closed = False
+        self._on_result_cb = None
+        self._on_error_cb = None
+
+    def build_initial_messages(self):
+        blocks = gather_recursive_context(self.func, self.config)
+        callee_funcs = (
+            gather_callee_funcs(self.func, self.config.max_callees)
+            if self.config.include_callees else []
+        )
+        callee_names = [
+            ida_funcs.get_func_name(f.start_ea) or ("sub_%X" % f.start_ea) for f in callee_funcs
+        ]
+        data_refs = (
+            gather_data_refs(self.func, self.config.max_data_refs, self.config.max_string_len)
+            if self.config.include_data_refs else []
+        )
+        user_msg = build_user_message(self.config, self.func, blocks, callee_names, data_refs)
+        self._fetched_eas = {ea for _, ea, _ in blocks}
+        self._root_is_pseudocode = bool(blocks) and blocks[0][2].kind == "pseudocode"
+        self.messages = [
+            {"role": "system", "content": self.config.system_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+        return self.messages
+
+    def start(self, on_result, on_error):
+        self._on_result_cb = on_result
+        self._on_error_cb = on_error
+        try:
+            self.build_initial_messages()
+        except Exception as exc:
+            self._on_error_cb("Failed to gather function context: %s" % exc)
+            return
+        self._issue_request()
+
+    def send_followup(self, user_text, on_result, on_error):
+        """Interactive-only: used by ExplainResultDialog's Reason More."""
+        self._on_result_cb = on_result
+        self._on_error_cb = on_error
+        self.messages.append({"role": "user", "content": user_text})
+        self._forced_final = False
+        self._issue_request()
+
+    def cancel(self):
+        self._closed = True
+        if self.worker is not None:
+            self.worker.cancel()
+
+    def _issue_request(self):
+        self.worker = LlamaStreamWorker(
+            self.config, list(self.messages),
+            self._on_delta, self._on_reasoning_delta,
+            self._on_worker_done, self._on_worker_error,
+        )
+        self.worker.start()
+
+    def _on_worker_error(self, message):
+        self.worker = None
+        if not self._closed:
+            self._on_error_cb(message)
+        return 0
+
+    def _on_worker_done(self, full_text, reasoning_text="", finish_reason=None):
+        self.worker = None
+        if self._closed:
+            return 0
+        text = full_text
+
+        if not text.strip():
+            if reasoning_text.strip():
+                msg = (
+                    "Model spent its whole token budget on reasoning and gave no "
+                    "answer (finish_reason=%s)." % (finish_reason or "unknown")
+                )
+            else:
+                msg = "Model returned an empty response (finish_reason=%s)." % (finish_reason or "unknown")
+            self._on_result_cb(ConversationResult(
+                text="", reasoning_text=reasoning_text, suggested_name=None,
+                suggested_signature=None, suggested_vars=[],
+                root_is_pseudocode=self._root_is_pseudocode, error=msg,
+            ))
+            return 0
+
+        self.messages.append({"role": "assistant", "content": text})
+
+        requests = _REQUEST_CODE_RE.findall(text)
+        if requests and not self._forced_final:
+            if self._auto_fetch_rounds < self.config.max_auto_fetch:
+                self._auto_fetch_rounds += 1
+                self._on_status("Fetching requested code (%s)..." % ", ".join(requests))
+                self._handle_code_requests(requests)
+                return 0
+            self._forced_final = True
+            self.messages.append({
+                "role": "user",
+                "content": (
+                    "You have reached the maximum number of code requests (%d). "
+                    "Please give your best explanation now based on the "
+                    "information already gathered, without requesting further "
+                    "code." % self.config.max_auto_fetch
+                ),
+            })
+            self._on_status("Auto-fetch limit reached; asking for a final answer...")
+            self._issue_request()
+            return 0
+
+        suggested_name = None
+        name_matches = _SUGGESTED_NAME_RE.findall(text)
+        if name_matches:
+            text = _SUGGESTED_NAME_RE.sub("", text).strip()
+            suggested_name = sanitize_suggested_name(name_matches[-1])
+
+        suggested_signature = None
+        sig_matches = _SUGGESTED_SIGNATURE_RE.findall(text)
+        if sig_matches:
+            text = _SUGGESTED_SIGNATURE_RE.sub("", text).strip()
+            candidate = sig_matches[-1].strip()
+            if candidate and self._root_is_pseudocode:
+                suggested_signature = candidate
+
+        suggested_vars = []
+        var_matches = _SUGGESTED_VAR_RE.findall(text)
+        if var_matches:
+            text = _SUGGESTED_VAR_RE.sub("", text).strip()
+            if self._root_is_pseudocode:
+                seen_old = set()
+                for old_name, new_name_var in var_matches:
+                    if old_name != new_name_var and old_name not in seen_old:
+                        seen_old.add(old_name)
+                        suggested_vars.append((old_name, new_name_var))
+
+        text = strip_markdown_fences(_REQUEST_CODE_RE.sub("", text).strip())
+
+        self._on_result_cb(ConversationResult(
+            text=text, reasoning_text=reasoning_text,
+            suggested_name=suggested_name, suggested_signature=suggested_signature,
+            suggested_vars=suggested_vars, root_is_pseudocode=self._root_is_pseudocode,
+            error=None,
+        ))
+        return 0
+
+    def _handle_code_requests(self, requests):
+        reply_parts = []
+        queried = []
+        seen_this_round = set()
+        for query in requests:
+            query = query.strip()
+            if not query or query in seen_this_round:
+                continue
+            seen_this_round.add(query)
+            queried.append(query)
+            func = resolve_function_query(query)
+            if func is None:
+                reply_parts.append("No function found matching '%s'." % query)
+                continue
+            if func.start_ea in self._fetched_eas:
+                name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
+                reply_parts.append("You already have the code for %s (see above)." % name)
+                continue
+            try:
+                ctx = gather_function_context(func)
+            except Exception as exc:
+                reply_parts.append("Failed to retrieve code for '%s': %s" % (query, exc))
+                continue
+            self._fetched_eas.add(func.start_ea)
+            reply_parts.append(format_function_block("Requested function", func.start_ea, ctx, self.config))
+
+        reply_text = "\n\n".join(reply_parts) if reply_parts else "No additional code available."
+        self.messages.append({"role": "user", "content": reply_text})
+        self._issue_request()
+
+
+# ---------------------------------------------------------------------------
 # UI: result dialog
 # ---------------------------------------------------------------------------
 
@@ -633,20 +932,12 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self.config = config
         self.func_ea = func.start_ea
         self.func_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
-        self.worker = None
-        self.messages = None
         self._buffer = []
         self._reasoning_buffer = []
         self._reasoning_shown = False
         self._last_answer_text = ""
         self._closed = False
-        self._fetched_eas = set()
-        self._auto_fetch_rounds = 0
-        self._forced_final = False
-        self._suggested_name = None
-        self._suggested_signature = None
         self._suggested_vars = []
-        self._root_is_pseudocode = False
 
         self.setWindowTitle("%s - %s @ %#x" % (PLUGIN_NAME, self.func_name, func.start_ea))
         self.resize(560, 520)
@@ -713,41 +1004,31 @@ class ExplainResultDialog(QtWidgets.QDialog):
         button_layout.addWidget(self.cancel_button)
         layout.addLayout(button_layout)
 
-        self._start_initial_request(func)
+        self.runner = ConversationRunner(
+            config, func,
+            on_delta=self._on_delta,
+            on_reasoning_delta=self._on_reasoning_delta,
+            on_status=self._on_runner_status,
+        )
+        self._begin_request("Querying model...")
+        self.runner.start(self._on_conversation_result, self._on_conversation_error)
 
     # -- request lifecycle --------------------------------------------------
 
-    def _start_initial_request(self, func):
-        try:
-            blocks = gather_recursive_context(func, self.config)
-            callee_funcs = gather_callee_funcs(func, self.config.max_callees) if self.config.include_callees else []
-            callee_names = [
-                ida_funcs.get_func_name(f.start_ea) or ("sub_%X" % f.start_ea) for f in callee_funcs
-            ]
-            user_msg = build_user_message(self.config, func, blocks, callee_names)
-        except Exception as exc:
-            self.status_label.setText("Failed to gather function context: %s" % exc)
-            return
-        self._fetched_eas = {ea for _, ea, _ in blocks}
-        self._root_is_pseudocode = bool(blocks) and blocks[0][2].kind == "pseudocode"
-        self.messages = [
-            {"role": "system", "content": self.config.system_prompt},
-            {"role": "user", "content": user_msg},
-        ]
-        self.start_request()
-
-    def start_request(self):
+    def _begin_request(self, status_text="Querying model..."):
         self._buffer = []
         self._reasoning_buffer = []
         self._reasoning_shown = False
-        self.status_label.setText("Querying model...")
+        self.status_label.setText(status_text)
         self.reason_button.setEnabled(False)
         self.followup_input.setEnabled(False)
-        self.worker = LlamaStreamWorker(
-            self.config, list(self.messages), self._on_delta, self._on_reasoning_delta,
-            self._on_done, self._on_error
-        )
-        self.worker.start()
+
+    def _on_runner_status(self, text):
+        self._begin_request(text)
+        try:
+            self.stream_edit.appendPlainText("\n\n--- %s ---\n" % text)
+        except RuntimeError:
+            pass
 
     # -- worker callbacks (run on IDA's main thread via execute_sync) -------
 
@@ -785,171 +1066,79 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self._insert_styled(piece)
         return 0
 
-    def _on_done(self, full_text, reasoning_text="", finish_reason=None):
-        if self._closed:
-            return 0
-        text = full_text if full_text else "".join(self._buffer)
-        reasoning = reasoning_text if reasoning_text else "".join(self._reasoning_buffer)
+    # -- conversation-runner callbacks ---------------------------------------
 
-        if not text.strip():
-            # Nothing usable came back - don't pollute the conversation history
-            # with an empty assistant turn, just explain what happened.
-            if reasoning.strip():
-                self.status_label.setText(
-                    "Model spent its whole token budget on reasoning and gave no "
-                    "answer (finish_reason=%s). Increase 'Max tokens' in Settings, "
-                    "or click Reason More to ask it to wrap up." % (finish_reason or "unknown")
-                )
-            else:
-                self.status_label.setText(
-                    "Model returned an empty response (finish_reason=%s)." % (finish_reason or "unknown")
-                )
+    def _on_conversation_result(self, result):
+        if self._closed:
+            return
+        if result.error:
+            self.status_label.setText(result.error)
             self.reason_button.setEnabled(True)
             self.followup_input.setEnabled(True)
-            self.accept_button.setEnabled(False)
-            self.worker = None
-            return 0
+            partial = "".join(self._buffer).strip()
+            self.accept_button.setEnabled(bool(partial))
+            return
 
-        if self.messages is not None:
-            self.messages.append({"role": "assistant", "content": text})
+        if result.suggested_name:
+            self.rename_edit.setText(result.suggested_name)
+            self.rename_check.setEnabled(True)
+            self.rename_edit.setEnabled(True)
+            self.rename_check.setChecked(is_auto_generated_name(self.func_name))
 
-        requests = _REQUEST_CODE_RE.findall(text)
-        if requests and not self._forced_final:
-            if self._auto_fetch_rounds < self.config.max_auto_fetch:
-                self._auto_fetch_rounds += 1
-                self._handle_code_requests(requests)
-                return 0
-            self._forced_final = True
-            self.messages.append({
-                "role": "user",
-                "content": (
-                    "You have reached the maximum number of code requests (%d). "
-                    "Please give your best explanation now based on the "
-                    "information already gathered, without requesting further "
-                    "code." % self.config.max_auto_fetch
-                ),
-            })
-            self.status_label.setText("Auto-fetch limit reached; asking for a final answer...")
-            self.start_request()
-            return 0
+        if result.suggested_signature:
+            self.signature_edit.setText(result.suggested_signature)
+            self.signature_check.setEnabled(True)
+            self.signature_edit.setEnabled(True)
+            self.signature_check.setChecked(True)
 
-        name_matches = _SUGGESTED_NAME_RE.findall(text)
-        if name_matches:
-            text = _SUGGESTED_NAME_RE.sub("", text).strip()
-            candidate = sanitize_suggested_name(name_matches[-1])
-            if candidate:
-                self._suggested_name = candidate
-                self.rename_edit.setText(candidate)
-                self.rename_check.setEnabled(True)
-                self.rename_edit.setEnabled(True)
-                self.rename_check.setChecked(is_auto_generated_name(self.func_name))
+        if result.suggested_vars:
+            self._suggested_vars = result.suggested_vars
+            self.varrename_label.setText(", ".join("%s -> %s" % p for p in result.suggested_vars))
+            self.varrename_check.setEnabled(True)
+            self.varrename_label.setEnabled(True)
+            self.varrename_check.setChecked(True)
 
-        sig_matches = _SUGGESTED_SIGNATURE_RE.findall(text)
-        if sig_matches:
-            text = _SUGGESTED_SIGNATURE_RE.sub("", text).strip()
-            candidate = sig_matches[-1].strip()
-            if candidate and self._root_is_pseudocode:
-                self._suggested_signature = candidate
-                self.signature_edit.setText(candidate)
-                self.signature_check.setEnabled(True)
-                self.signature_edit.setEnabled(True)
-                self.signature_check.setChecked(True)
-
-        var_matches = _SUGGESTED_VAR_RE.findall(text)
-        if var_matches:
-            text = _SUGGESTED_VAR_RE.sub("", text).strip()
-            if self._root_is_pseudocode:
-                pairs = []
-                seen_old = set()
-                for old_name, new_name_var in var_matches:
-                    if old_name != new_name_var and old_name not in seen_old:
-                        seen_old.add(old_name)
-                        pairs.append((old_name, new_name_var))
-                if pairs:
-                    self._suggested_vars = pairs
-                    self.varrename_label.setText(", ".join("%s -> %s" % p for p in pairs))
-                    self.varrename_check.setEnabled(True)
-                    self.varrename_label.setEnabled(True)
-                    self.varrename_check.setChecked(True)
-
-        self._last_answer_text = text
+        self._last_answer_text = result.text
         self.status_label.setText("Done.")
         self.reason_button.setEnabled(True)
         self.followup_input.setEnabled(True)
-        self.accept_button.setEnabled(bool(text.strip()))
-        self.worker = None
-        return 0
+        self.accept_button.setEnabled(bool(result.text.strip()))
 
-    def _handle_code_requests(self, requests):
-        self.status_label.setText("Model requested more code, fetching...")
-        reply_parts = []
-        queried = []
-        seen_this_round = set()
-        for query in requests:
-            query = query.strip()
-            if not query or query in seen_this_round:
-                continue
-            seen_this_round.add(query)
-            queried.append(query)
-            func = resolve_function_query(query)
-            if func is None:
-                reply_parts.append("No function found matching '%s'." % query)
-                continue
-            if func.start_ea in self._fetched_eas:
-                name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
-                reply_parts.append("You already have the code for %s (see above)." % name)
-                continue
-            try:
-                ctx = gather_function_context(func)
-            except Exception as exc:
-                reply_parts.append("Failed to retrieve code for '%s': %s" % (query, exc))
-                continue
-            self._fetched_eas.add(func.start_ea)
-            reply_parts.append(format_function_block("Requested function", func.start_ea, ctx, self.config))
-
-        reply_text = "\n\n".join(reply_parts) if reply_parts else "No additional code available."
-        self.messages.append({"role": "user", "content": reply_text})
-        try:
-            self.stream_edit.appendPlainText(
-                "\n\n--- Fetching requested code (%s) ---\n" % ", ".join(queried)
-            )
-        except RuntimeError:
-            pass
-        self.start_request()
-
-    def _on_error(self, message):
+    def _on_conversation_error(self, message):
         if self._closed:
-            return 0
+            return
         self.status_label.setText("Error: %s" % message)
         self.reason_button.setEnabled(True)
         self.followup_input.setEnabled(True)
         partial = "".join(self._buffer).strip()
         self.accept_button.setEnabled(bool(partial or self._last_answer_text.strip()))
-        self.worker = None
-        return 0
 
     # -- button handlers ------------------------------------------------
 
     def on_reason_more(self):
-        if self.worker is not None or self.messages is None:
+        if self.runner.worker is not None:
             return
         followup = self.followup_input.text().strip()
         if not followup:
             followup = "Please explain your reasoning in more detail."
-        self.messages.append({"role": "user", "content": followup})
         self.followup_input.clear()
-        self._forced_final = False
+        self._begin_request("Querying model...")
         try:
             self.stream_edit.appendPlainText("\n\n--- Follow-up: %s ---\n" % followup)
         except RuntimeError:
             pass
-        self.start_request()
+        self.runner.send_followup(followup, self._on_conversation_result, self._on_conversation_error)
 
     def on_accept(self):
         text = (self._last_answer_text or "".join(self._buffer)).strip()
         if not text:
             ida_kernwin.warning("Nothing to accept yet.")
             return
+        # Defensive: still strip markers/fences here even though
+        # ConversationRunner already does this for a normal successful
+        # result, because the "".join(self._buffer) fallback above (used
+        # when accepting a partial answer after a transport error) never
+        # passes through that cleanup.
         comment = strip_markdown_fences(text)
         comment = _REQUEST_CODE_RE.sub("", comment)
         comment = _SUGGESTED_NAME_RE.sub("", comment)
@@ -980,8 +1169,7 @@ class ExplainResultDialog(QtWidgets.QDialog):
 
     def closeEvent(self, event):
         self._closed = True
-        if self.worker is not None:
-            self.worker.cancel()
+        self.runner.cancel()
         super().closeEvent(event)
 
 
@@ -1046,6 +1234,18 @@ class SettingsDialog(QtWidgets.QDialog):
         self.max_callees_spin.setRange(0, 200)
         form.addRow("Max callees listed:", self.max_callees_spin)
 
+        self.include_data_refs_check = QtWidgets.QCheckBox("Include referenced strings/globals in prompt")
+        form.addRow(self.include_data_refs_check)
+
+        self.max_data_refs_spin = QtWidgets.QSpinBox()
+        self.max_data_refs_spin.setRange(0, 200)
+        form.addRow("Max data refs listed:", self.max_data_refs_spin)
+
+        self.max_string_len_spin = QtWidgets.QSpinBox()
+        self.max_string_len_spin.setRange(20, 2000)
+        self.max_string_len_spin.setSingleStep(10)
+        form.addRow("Max string length shown:", self.max_string_len_spin)
+
         self.follow_calls_spin = QtWidgets.QSpinBox()
         self.follow_calls_spin.setRange(0, 5)
         self.follow_calls_spin.setToolTip(
@@ -1106,6 +1306,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.max_context_spin.setValue(config.max_context_chars)
         self.include_callees_check.setChecked(config.include_callees)
         self.max_callees_spin.setValue(config.max_callees)
+        self.include_data_refs_check.setChecked(config.include_data_refs)
+        self.max_data_refs_spin.setValue(config.max_data_refs)
+        self.max_string_len_spin.setValue(config.max_string_len)
         self.follow_calls_spin.setValue(config.follow_calls_depth)
         self.max_total_context_spin.setValue(config.max_total_context_chars)
         self.max_auto_fetch_spin.setValue(config.max_auto_fetch)
@@ -1133,6 +1336,9 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.max_context_chars = self.max_context_spin.value()
         cfg.include_callees = self.include_callees_check.isChecked()
         cfg.max_callees = self.max_callees_spin.value()
+        cfg.include_data_refs = self.include_data_refs_check.isChecked()
+        cfg.max_data_refs = self.max_data_refs_spin.value()
+        cfg.max_string_len = self.max_string_len_spin.value()
         cfg.follow_calls_depth = self.follow_calls_spin.value()
         cfg.max_total_context_chars = self.max_total_context_spin.value()
         cfg.max_auto_fetch = self.max_auto_fetch_spin.value()
@@ -1141,6 +1347,307 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg._validate()
         self.result_config = cfg
         self.accept()
+
+
+# ---------------------------------------------------------------------------
+# UI: batch explain
+# ---------------------------------------------------------------------------
+
+class BatchPickerDialog(QtWidgets.QDialog):
+    """Checkable list of every function in the database, with a live text
+    filter (hides/shows rows, never rebuilds the list - checked state
+    survives filtering). Nothing is pre-checked; the user picks explicitly.
+
+    Deliberately does NOT try to read the native Functions-window's current
+    multi-selection (ida_kernwin.get_chooser_selection) to pre-populate
+    this - that API's exact behavior, and whether its row order always
+    matches idautils.Functions() address order (it may not if the user
+    re-sorted a column), were not confidently verified for this plugin.
+    A fully self-contained picker avoids that risk entirely.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("%s - Batch Explain: Select Functions" % PLUGIN_NAME)
+        self.resize(520, 640)
+
+        self.filter_edit = QtWidgets.QLineEdit()
+        self.filter_edit.setPlaceholderText("Filter by name...")
+        self.filter_edit.textChanged.connect(self._apply_filter)
+
+        self.list_widget = QtWidgets.QListWidget()
+        self.list_widget.setUniformItemSizes(True)
+        self._populate()
+
+        select_all_btn = QtWidgets.QPushButton("Select All Filtered")
+        select_all_btn.clicked.connect(lambda: self._set_checked_filtered(True))
+        deselect_all_btn = QtWidgets.QPushButton("Deselect All Filtered")
+        deselect_all_btn.clicked.connect(lambda: self._set_checked_filtered(False))
+
+        self.count_label = QtWidgets.QLabel("0 selected")
+        self.list_widget.itemChanged.connect(self._update_count)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.filter_edit)
+        layout.addWidget(self.list_widget, 1)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(select_all_btn)
+        row.addWidget(deselect_all_btn)
+        row.addStretch(1)
+        row.addWidget(self.count_label)
+        layout.addLayout(row)
+        layout.addWidget(buttons)
+
+    def _populate(self):
+        self.list_widget.setUpdatesEnabled(False)
+        for ea in idautils.Functions():
+            name = ida_funcs.get_func_name(ea) or ("sub_%X" % ea)
+            item = QtWidgets.QListWidgetItem("%s @ %#010x" % (name, ea))
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, ea)
+            self.list_widget.addItem(item)
+        self.list_widget.setUpdatesEnabled(True)
+
+    def _apply_filter(self, text):
+        needle = text.strip().lower()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            item.setHidden(bool(needle) and needle not in item.text().lower())
+
+    def _set_checked_filtered(self, checked):
+        state = QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if not item.isHidden():
+                item.setCheckState(state)
+
+    def _update_count(self, _item=None):
+        n = sum(
+            1 for i in range(self.list_widget.count())
+            if self.list_widget.item(i).checkState() == QtCore.Qt.CheckState.Checked
+        )
+        self.count_label.setText("%d selected" % n)
+
+    def get_selected_functions(self):
+        result = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                ea = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                func = ida_funcs.get_func(ea)
+                if func is not None:
+                    result.append(func)
+        return result
+
+
+BatchItemResult = namedtuple("BatchItemResult", [
+    "func_ea", "orig_name", "ok", "message", "comment",
+    "suggested_name", "suggested_signature", "suggested_vars", "root_is_pseudocode",
+])
+
+
+class BatchController(object):
+    """Drives a sequence of ConversationRunners, one function at a time, on
+    IDA's main thread. No separate background thread is needed:
+    ConversationRunner.start()/send_followup() already return immediately
+    (spawning a LlamaStreamWorker thread), and that worker's completion
+    callbacks already arrive on the main thread via execute_sync. So the
+    batch driver is just a plain object whose on_result/on_error callback,
+    once invoked, starts the next function.
+    """
+
+    def __init__(self, config, funcs, on_row_update, on_finished):
+        self.config = config
+        self.funcs = funcs
+        self._on_row_update = on_row_update
+        self._on_finished = on_finished
+        self._index = 0
+        self._cancelled = False
+        self._runner = None
+        self.results = {}
+
+    def start(self):
+        self._process_next()
+
+    def cancel(self):
+        """Cancelling an in-flight LlamaStreamWorker suppresses BOTH its
+        on_done and on_error callbacks (both gated by the worker's own
+        cancel_event check), so no completion callback will ever arrive
+        for the in-flight function. This must therefore mark the current
+        and all remaining rows as Cancelled synchronously, rather than
+        waiting for a callback that will never come.
+        """
+        if self._cancelled:
+            return
+        self._cancelled = True
+        if self._runner is not None:
+            self._runner.cancel()
+            self._on_row_update(self._index, "Cancelled", "")
+            self._runner = None
+            start_remaining = self._index + 1
+        else:
+            start_remaining = self._index
+        for i in range(start_remaining, len(self.funcs)):
+            self._on_row_update(i, "Cancelled", "")
+        self._on_finished()
+
+    def _process_next(self):
+        if self._cancelled or self._index >= len(self.funcs):
+            self._on_finished()
+            return
+        func = self.funcs[self._index]
+        self._on_row_update(self._index, "Running", "")
+        self._runner = ConversationRunner(
+            self.config, func,
+            on_status=functools.partial(self._on_status, self._index),
+        )
+        self._runner.start(
+            on_result=functools.partial(self._on_result, self._index, func),
+            on_error=functools.partial(self._on_error, self._index, func),
+        )
+
+    def _on_status(self, index, text):
+        self._on_row_update(index, "Running", text)
+
+    def _record_and_advance(self, item):
+        self.results[item.func_ea] = item
+        self._runner = None
+        self._index += 1
+        self._process_next()
+
+    def _on_result(self, index, func, result):
+        orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
+        if result.error:
+            item = BatchItemResult(func.start_ea, orig_name, False, result.error,
+                                    None, None, None, [], result.root_is_pseudocode)
+            self._on_row_update(index, "Error", result.error)
+        else:
+            item = BatchItemResult(func.start_ea, orig_name, True, None, result.text,
+                                    result.suggested_name, result.suggested_signature,
+                                    result.suggested_vars, result.root_is_pseudocode)
+            self._on_row_update(index, "Done", result.text[:120])
+        self._record_and_advance(item)
+
+    def _on_error(self, index, func, message):
+        orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
+        item = BatchItemResult(func.start_ea, orig_name, False, message,
+                                None, None, None, [], False)
+        self._on_row_update(index, "Error", message)
+        self._record_and_advance(item)
+
+
+def _apply_batch_and_refresh(items):
+    """items: list of (func_ea, comment, new_name, signature, var_renames).
+    One execute_sync/MFF_WRITE round-trip for the whole batch instead of N.
+    """
+    for func_ea, comment, new_name, signature, var_renames in items:
+        _apply_suggestions_and_refresh(func_ea, comment, new_name, signature, var_renames)
+    return 1
+
+
+class BatchProgressDialog(QtWidgets.QDialog):
+    """Table: [Apply checkbox | Function | Status | Comment/Error preview].
+    Never auto-writes - always Cancel-while-running, then an
+    Apply-Selected-after-review step, matching the plugin's
+    human-in-the-loop philosophy used everywhere else. No "Reason More" in
+    batch mode - close this dialog and use the interactive single-function
+    dialog to refine any one function further.
+    """
+
+    COL_APPLY, COL_FUNC, COL_STATUS, COL_PREVIEW = range(4)
+
+    def __init__(self, config, funcs, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("%s - Batch Explain Progress" % PLUGIN_NAME)
+        self.resize(720, 480)
+        self.funcs = funcs
+
+        self.table = QtWidgets.QTableWidget(len(funcs), 4)
+        self.table.setHorizontalHeaderLabels(["Apply", "Function", "Status", "Comment / Error"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for i, func in enumerate(funcs):
+            name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
+            check_item = QtWidgets.QTableWidgetItem()
+            check_item.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            check_item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            self.table.setItem(i, self.COL_APPLY, check_item)
+            self.table.setItem(i, self.COL_FUNC, QtWidgets.QTableWidgetItem("%s @ %#x" % (name, func.start_ea)))
+            self.table.setItem(i, self.COL_STATUS, QtWidgets.QTableWidgetItem("Pending"))
+            self.table.setItem(i, self.COL_PREVIEW, QtWidgets.QTableWidgetItem(""))
+
+        self.cancel_button = QtWidgets.QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self._on_cancel)
+        self.apply_button = QtWidgets.QPushButton("Apply Selected")
+        self.apply_button.setEnabled(False)
+        self.apply_button.clicked.connect(self._apply_selected)
+        self.close_button = QtWidgets.QPushButton("Close")
+        self.close_button.clicked.connect(self.close)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(self.cancel_button)
+        button_row.addWidget(self.apply_button)
+        button_row.addWidget(self.close_button)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.table, 1)
+        layout.addLayout(button_row)
+
+        self.controller = BatchController(config, funcs, self._on_row_update, self._on_batch_finished)
+        self.controller.start()
+
+    def _on_row_update(self, index, status, preview):
+        self.table.item(index, self.COL_STATUS).setText(status)
+        if preview:
+            self.table.item(index, self.COL_PREVIEW).setText(preview)
+
+    def _on_batch_finished(self):
+        self.cancel_button.setEnabled(False)
+        for i, func in enumerate(self.funcs):
+            item = self.controller.results.get(func.start_ea)
+            check_item = self.table.item(i, self.COL_APPLY)
+            if item is not None and item.ok:
+                check_item.setFlags(check_item.flags() | QtCore.Qt.ItemFlag.ItemIsEnabled)
+                check_item.setCheckState(QtCore.Qt.CheckState.Checked)
+            else:
+                check_item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        self.apply_button.setEnabled(True)
+
+    def _on_cancel(self):
+        self.controller.cancel()
+
+    def _apply_selected(self):
+        items_to_apply = []
+        for i, func in enumerate(self.funcs):
+            if self.table.item(i, self.COL_APPLY).checkState() != QtCore.Qt.CheckState.Checked:
+                continue
+            item = self.controller.results.get(func.start_ea)
+            if item is None or not item.ok:
+                continue
+            new_name = None
+            if item.suggested_name and is_auto_generated_name(item.orig_name):
+                new_name = item.suggested_name
+            signature = item.suggested_signature if item.root_is_pseudocode else None
+            var_renames = item.suggested_vars if (item.root_is_pseudocode and item.suggested_vars) else None
+            items_to_apply.append((item.func_ea, item.comment, new_name, signature, var_renames))
+        if not items_to_apply:
+            return
+        ida_kernwin.execute_sync(
+            functools.partial(_apply_batch_and_refresh, items_to_apply), ida_kernwin.MFF_WRITE
+        )
+        self.apply_button.setEnabled(False)
+
+    def closeEvent(self, event):
+        self.controller.cancel()
+        super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------------
@@ -1170,11 +1677,35 @@ class ExplainActionHandler(ida_kernwin.action_handler_t):
         return ida_kernwin.AST_ENABLE_FOR_WIDGET if _resolve_func(ctx) else ida_kernwin.AST_DISABLE_FOR_WIDGET
 
 
+class BatchActionHandler(ida_kernwin.action_handler_t):
+    def __init__(self):
+        super().__init__()
+
+    def activate(self, ctx):
+        plugin = LLMExplainerPlugin.instance
+        if plugin is None:
+            return 0
+        picker = BatchPickerDialog()
+        if picker.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return 0
+        funcs = picker.get_selected_functions()
+        if not funcs:
+            ida_kernwin.warning("No functions selected.")
+            return 0
+        plugin.open_batch_dialog(funcs)
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
 class PopupHooks(ida_kernwin.UI_Hooks):
     def finish_populating_widget_popup(self, widget, popup, ctx=None):
         wtype = ida_kernwin.get_widget_type(widget)
         if wtype in (ida_kernwin.BWN_PSEUDOCODE, ida_kernwin.BWN_DISASM):
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN, "LLM Explainer/")
+        elif wtype == ida_kernwin.BWN_FUNCS:
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_BATCH, "LLM Explainer/")
 
 
 class LLMExplainerPlugin(idaapi.plugin_t):
@@ -1183,7 +1714,8 @@ class LLMExplainerPlugin(idaapi.plugin_t):
     help = (
         "Right-click a function in the disassembly or pseudocode view (or "
         "use the configured hotkey) to ask the configured llama.cpp server "
-        "to explain it. Edit > Plugins > LLM Explainer opens settings."
+        "to explain it. Right-click in the Functions window to batch-explain "
+        "multiple functions. Edit > Plugins > LLM Explainer opens settings."
     )
     wanted_name = PLUGIN_NAME
     wanted_hotkey = ""
@@ -1195,6 +1727,7 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         self.config = PluginConfig.load()
         self._open_dialogs = []
         self._action_handler = ExplainActionHandler()
+        self._batch_action_handler = BatchActionHandler()
 
         action = ida_kernwin.action_desc_t(
             ACTION_ID_EXPLAIN,
@@ -1206,6 +1739,23 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         )
         if not ida_kernwin.register_action(action):
             ida_kernwin.msg("[%s] Failed to register action.\n" % PLUGIN_NAME)
+
+        batch_action = ida_kernwin.action_desc_t(
+            ACTION_ID_BATCH,
+            "Batch Explain Functions...",
+            self._batch_action_handler,
+            None,
+            "Ask the local LLM to explain multiple selected functions",
+            -1,
+        )
+        if not ida_kernwin.register_action(batch_action):
+            ida_kernwin.msg("[%s] Failed to register batch action.\n" % PLUGIN_NAME)
+        try:
+            ida_kernwin.attach_action_to_menu(
+                "Edit/Plugins/", ACTION_ID_BATCH, ida_kernwin.SETMENU_APP
+            )
+        except Exception:
+            pass
 
         self._popup_hooks = PopupHooks()
         self._popup_hooks.hook()
@@ -1253,10 +1803,13 @@ class LLMExplainerPlugin(idaapi.plugin_t):
             ida_kernwin.unregister_action(ACTION_ID_EXPLAIN)
         except Exception:
             pass
+        try:
+            ida_kernwin.unregister_action(ACTION_ID_BATCH)
+        except Exception:
+            pass
         LLMExplainerPlugin.instance = None
 
-    def open_explain_dialog(self, func):
-        dlg = ExplainResultDialog(self.config, func)
+    def _track_dialog(self, dlg):
         dlg.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
         self._open_dialogs.append(dlg)
 
@@ -1269,6 +1822,14 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         dlg.raise_()
         dlg.activateWindow()
         return dlg
+
+    def open_explain_dialog(self, func):
+        dlg = ExplainResultDialog(self.config, func)
+        return self._track_dialog(dlg)
+
+    def open_batch_dialog(self, funcs):
+        dlg = BatchProgressDialog(self.config, funcs)
+        return self._track_dialog(dlg)
 
 
 def PLUGIN_ENTRY():
