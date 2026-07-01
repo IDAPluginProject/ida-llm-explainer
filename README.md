@@ -1,0 +1,124 @@
+# LLM Explainer
+
+An IDA Pro 9.2 plugin that asks a locally-running [llama.cpp](https://github.com/ggml-org/llama.cpp)
+server (`llama-server`) to explain the function you're looking at — in either the Hex-Rays
+pseudocode view or the plain disassembly view — and streams the answer into a small,
+non-modal review dialog. Nothing is written to your database until you explicitly click Accept.
+
+## Features
+
+- **Right-click, explain**: works from the pseudocode view, the disassembly view, or a
+  configurable hotkey (default `Ctrl-Alt-E`).
+- **Live streaming**: the answer streams in as it's generated. For "thinking"/reasoning models
+  (e.g. Qwen3) the chain-of-thought is shown separately, in gray italics, from the real answer.
+- **Human in the loop**: every result is Accept / Reason More / Cancel — the model never writes
+  to the database on its own.
+- **Call-graph awareness**: optionally follow called functions recursively (up to a configurable
+  depth) so the model sees callee code up front, and/or let the model ask for a specific callee's
+  code on demand mid-conversation (`REQUEST_CODE: <name-or-address>`), which the plugin fetches
+  and feeds back automatically.
+- **String/global context**: referenced string literals and named globals are included in the
+  prompt, since they're often the strongest clue to a function's purpose.
+- **Rename & retype suggestions**: the model can propose a better function name, a full C
+  signature (return type + argument types/names, Hex-Rays only), and local variable renames —
+  each shown as an editable, opt-in checkbox before you accept.
+- **Batch mode**: pick a set of functions (filterable checklist), process them sequentially, then
+  review and apply the results in bulk — same human-in-the-loop guarantee as the single-function
+  flow.
+
+## Requirements
+
+- IDA Pro 9.2 or later (PySide6 is bundled with IDA — no extra Python packages to install).
+- A running `llama-server` reachable over HTTP, reachable at the configured base URL
+  (default `http://127.0.0.1:8080`).
+- The Hex-Rays decompiler is optional. If it isn't available for the current architecture, the
+  plugin automatically falls back to a plain disassembly listing.
+
+## Installation
+
+Copy `llm_explainer.py` into one of IDA's plugin directories:
+
+- **Per-user** (recommended, no admin rights needed):
+  `<IDA user dir>\plugins\llm_explainer.py`
+  On Windows this is typically `%APPDATA%\Hex-Rays\IDA Pro\plugins\llm_explainer.py`.
+- **Global** (all users of this IDA install):
+  `<IDA install dir>\plugins\llm_explainer.py`
+
+Restart IDA (or reload plugins) afterward.
+
+## Usage
+
+### Explain a single function
+
+1. Open a function in the pseudocode or disassembly view.
+2. Right-click → **LLM Explainer → Explain function with LLM...** (or press the hotkey).
+3. Watch the answer stream in. If the model needs to see a called function's code to answer
+   accurately, it will fetch it automatically (up to the configured limit) — you'll see this
+   noted in the transcript.
+4. Review the proposed comment and any suggested rename / signature / variable renames (each has
+   its own checkbox and is editable before you commit).
+5. Click **Accept & Add Comment** to write everything to the database, **Reason More** to ask a
+   follow-up question, or **Cancel** to discard.
+
+### Batch-explain multiple functions
+
+1. Right-click in the **Functions** window → **LLM Explainer → Batch Explain Functions...**
+   (or Edit → Plugins → Batch Explain Functions...).
+2. Filter and check the functions you want processed. Nothing is pre-selected.
+3. The progress dialog processes them one at a time (sequential by design — a typical local
+   `llama-server` only has one inference slot anyway) and shows live status per function.
+4. Once finished, check/uncheck rows (successful ones are checked by default) and click
+   **Apply Selected** to write all of them in one batch. There is no follow-up chat in batch
+   mode — reopen the single-function flow on a specific function if you want to refine it further.
+
+## Configuration
+
+Open **Edit → Plugins → LLM Explainer** to configure:
+
+| Setting | Default | Notes |
+|---|---|---|
+| Server base URL | `http://127.0.0.1:8080` | Your `llama-server` endpoint |
+| Model name | *(blank)* | Only needed if your server hosts multiple models |
+| API key | *(blank)* | Optional bearer token |
+| Temperature | `0.2` | |
+| Max tokens | `16384` | Reasoning models can spend thousands of tokens thinking before answering — keep this generous |
+| Request timeout (s) | `300` | Per-chunk socket timeout, not a total-generation cap |
+| Max context chars | `12000` | Per-function truncation budget |
+| Include called-function names | on | |
+| Max callees listed | `20` | |
+| Include referenced strings/globals | on | |
+| Max data refs listed | `20` | |
+| Max string length shown | `150` | |
+| Follow calls depth | `0` | `0` = target function only; `N>0` eagerly includes N levels of callee code |
+| Max total context chars | `40000` | Overall budget when following calls |
+| Max on-demand code requests | `5` | Cap on automatic `REQUEST_CODE` round-trips per conversation |
+| Explain hotkey | `Ctrl-Alt-E` | |
+| System prompt | *(editable)* | Governs the whole protocol below |
+
+A **Restore Defaults** button resets the form (not saved until you click OK). Settings persist
+as JSON under your IDA user directory (`llm_explainer.cfg.json`).
+
+## The prompt protocol
+
+The system prompt teaches the model a small text protocol so the plugin can parse structured
+suggestions out of an otherwise free-form answer:
+
+- `REQUEST_CODE: <function name or address>` — ask for a called function's code before
+  answering (handled automatically, looping up to the configured limit).
+- `SUGGESTED_NAME: <name>` — a proposed function name.
+- `SUGGESTED_SIGNATURE: <C declaration>` — a proposed return type + argument types/names
+  (Hex-Rays pseudocode only).
+- `SUGGESTED_VAR: <old> -> <new>` — a proposed local variable rename (Hex-Rays pseudocode only,
+  one per line).
+
+The final answer itself is kept to one short sentence, since it's written verbatim into the
+function's comment.
+
+## License
+
+No explicit license has been chosen yet — treat as all rights reserved unless the author
+specifies otherwise.
+
+## Copyright
+
+© 2026 Peter Garba

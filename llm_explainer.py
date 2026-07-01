@@ -75,9 +75,22 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 PLUGIN_NAME = "LLM Explainer"
 PLUGIN_VERSION = "1.0.0"
+PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
 CONFIG_FILENAME = "llm_explainer.cfg.json"
+
+
+def _add_copyright_footer(layout):
+    label = QtWidgets.QLabel(PLUGIN_COPYRIGHT)
+    label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+    font = label.font()
+    font.setPointSize(max(7, font.pointSize() - 2))
+    label.setFont(font)
+    palette = label.palette()
+    palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("gray"))
+    label.setPalette(palette)
+    layout.addWidget(label)
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert reverse engineer assisting inside IDA Pro. You will "
@@ -88,13 +101,22 @@ DEFAULT_SYSTEM_PROMPT = (
     "of some called functions already included below the target "
     "function.\n\n"
     "If understanding the target function requires seeing the code of a "
-    "called function that was NOT already included, you may request it: "
-    "reply with one or more lines of the exact form\n"
+    "called function that was NOT already included, you MUST request it "
+    "before answering - do not guess or describe the callee generically "
+    "(e.g. as \"a helper function\") when its actual behavior would change "
+    "your answer. This especially applies when the target function calls "
+    "another function whose name looks auto-generated (sub_, loc_, j_ "
+    "followed by a hex address) and whose purpose is not already obvious "
+    "from the strings/globals referenced: in that case, request its code "
+    "first rather than describing it vaguely. To request it, reply with "
+    "one or more lines of the exact form\n"
     "REQUEST_CODE: <function name or address>\n"
     "and nothing else in that reply. You will then be given that function's "
     "code in a follow-up message and can continue reasoning. Only request "
     "functions that are actually relevant, and never request the same "
-    "function twice.\n\n"
+    "function twice. Taking one or more REQUEST_CODE turns before your "
+    "final answer is expected and does not violate the one-sentence rule "
+    "below, which only applies to your actual final answer.\n\n"
     "Once you have enough information, give your final answer as exactly "
     "ONE short sentence (no more than ~20 words) stating precisely what the "
     "target function does - its core purpose only, not a step-by-step "
@@ -1004,6 +1026,8 @@ class ExplainResultDialog(QtWidgets.QDialog):
         button_layout.addWidget(self.cancel_button)
         layout.addLayout(button_layout)
 
+        _add_copyright_footer(layout)
+
         self.runner = ConversationRunner(
             config, func,
             on_delta=self._on_delta,
@@ -1293,6 +1317,7 @@ class SettingsDialog(QtWidgets.QDialog):
         outer = QtWidgets.QVBoxLayout(self)
         outer.addLayout(form)
         outer.addWidget(buttons)
+        _add_copyright_footer(outer)
 
         self._populate(config)
 
@@ -1404,6 +1429,7 @@ class BatchPickerDialog(QtWidgets.QDialog):
         row.addWidget(self.count_label)
         layout.addLayout(row)
         layout.addWidget(buttons)
+        _add_copyright_footer(layout)
 
     def _populate(self):
         self.list_widget.setUpdatesEnabled(False)
@@ -1600,6 +1626,7 @@ class BatchProgressDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self.table, 1)
         layout.addLayout(button_row)
+        _add_copyright_footer(layout)
 
         self.controller = BatchController(config, funcs, self._on_row_update, self._on_batch_finished)
         self.controller.start()
