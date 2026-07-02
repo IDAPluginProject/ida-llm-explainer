@@ -32,11 +32,15 @@ current architecture the plugin falls back to a plain disassembly listing
 automatically.
 
 Configure the server URL(s), model, and other options via
-Edit > Plugins > LLM Explainer. The interactive single-function explain
-always talks to the first configured server. If llama-server is run with a
-single inference slot, opening several "explain" dialogs at once will
-simply queue their requests on that server - that is a server/deployment
-concern, not a bug in this plugin.
+Edit > Plugins > LLM Explainer. Server list order is priority order: the
+interactive single-function explain talks to the first configured server,
+and if a request to a server is refused, drops mid-stream, or the server
+answers with HTTP 502/503/504, the conversation automatically retries
+against the next configured server before giving up - so a server that's
+offline or overloaded is skipped rather than failing the whole request. If
+llama-server is run with a single inference slot, opening several
+"explain" dialogs at once will simply queue their requests on that server -
+that is a server/deployment concern, not a bug in this plugin.
 
 To process many functions at once, right-click in the Functions window (or
 use Edit > Plugins > Batch Explain Functions...) to pick a set of functions,
@@ -221,6 +225,7 @@ DEFAULT_SYSTEM_PROMPT = (
 
 DEFAULT_CONFIG = {
     "server_urls": ["http://127.0.0.1:8080"],
+    "server_names": {},
     "model": "",
     "api_key": "",
     "temperature": 0.2,
@@ -753,19 +758,47 @@ class PluginConfig(object):
     def clone(self):
         return PluginConfig(**self.to_dict())
 
+    def server_label(self, url):
+        """Short display label for a server: its configured name/comment if
+        any, else the raw URL. For compact UI use (status lines, table
+        previews)."""
+        name = (self.server_names or {}).get(url)
+        return name if name else url
+
+    def server_label_full(self, url):
+        """Longer display label that always includes the URL, even when a
+        name is set, for logs/tooltips where disambiguation matters more
+        than brevity."""
+        name = (self.server_names or {}).get(url)
+        return "%s (%s)" % (name, url) if name else url
+
     def _validate(self):
         cleaned_urls = []
         seen_urls = set()
+        url_normalize_map = {}
         for url in (self.server_urls or []):
             if not isinstance(url, str):
                 continue
+            original = url
             url = url.strip().rstrip("/")
             if not url or not (url.startswith("http://") or url.startswith("https://")):
                 continue
+            url_normalize_map[original] = url
             if url not in seen_urls:
                 seen_urls.add(url)
                 cleaned_urls.append(url)
         self.server_urls = cleaned_urls or list(DEFAULT_CONFIG["server_urls"])
+
+        cleaned_names = {}
+        if isinstance(self.server_names, dict):
+            for raw_url, name in self.server_names.items():
+                if not isinstance(raw_url, str) or not isinstance(name, str):
+                    continue
+                normalized_url = url_normalize_map.get(raw_url, raw_url.strip().rstrip("/"))
+                name = name.strip()
+                if name and normalized_url in seen_urls:
+                    cleaned_names[normalized_url] = name
+        self.server_names = cleaned_names
         try:
             self.temperature = max(0.0, min(2.0, float(self.temperature)))
         except (TypeError, ValueError):
@@ -822,6 +855,15 @@ class PluginConfig(object):
 # Networking (background thread, SSE streaming over urllib)
 # ---------------------------------------------------------------------------
 
+class _ServerConnectionError(RuntimeError):
+    """Raised specifically for connection-level failures (refused, DNS,
+    timeout, dropped mid-stream) and for HTTP 502/503/504, so callers can
+    distinguish "this server is unreachable/overloaded" from other errors
+    (bad request, model error) and fail over to another configured server
+    instead of just reporting failure.
+    """
+
+
 class LlamaStreamWorker(threading.Thread):
     """Runs one chat-completion request against llama-server, streaming the
     answer via SSE. All callbacks are marshalled onto IDA's main thread with
@@ -855,8 +897,9 @@ class LlamaStreamWorker(threading.Thread):
             self._stream()
         except Exception as exc:
             if not self._cancel_event.is_set():
+                is_connection_error = isinstance(exc, _ServerConnectionError)
                 ida_kernwin.execute_sync(
-                    functools.partial(self._on_error, str(exc)), ida_kernwin.MFF_FAST
+                    functools.partial(self._on_error, str(exc), is_connection_error), ida_kernwin.MFF_FAST
                 )
 
     def _stream(self):
@@ -884,51 +927,63 @@ class LlamaStreamWorker(threading.Thread):
                 body = exc.read().decode("utf-8", "replace")[:2000]
             except Exception:
                 pass
+            if exc.code in (502, 503, 504):
+                # Reachable (e.g. a reverse proxy answered) but the model
+                # server itself is overloaded/unavailable - worth failing
+                # over to another configured server, same as a dropped
+                # connection.
+                raise _ServerConnectionError("HTTP %s from %s: %s" % (exc.code, url, body)) from None
             raise RuntimeError("HTTP %s: %s" % (exc.code, body)) from None
-        except urllib.error.URLError as exc:
-            raise RuntimeError("Cannot connect to %s (%s)" % (url, exc.reason)) from None
+        except (urllib.error.URLError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            raise _ServerConnectionError("Cannot connect to %s (%s)" % (url, reason)) from None
 
         parts = []
         reasoning_parts = []
         finish_reason = [None]
-        with self._response as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            if not content_type.startswith("text/event-stream"):
-                self._handle_non_stream_body(resp.read(), parts, reasoning_parts, finish_reason)
-            else:
-                for raw_line in resp:
-                    if self._cancel_event.is_set():
-                        return
-                    line = raw_line.decode("utf-8", "replace").strip("\r\n")
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[len("data:"):].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        obj = json.loads(data_str)
-                    except ValueError:
-                        continue
-                    choices = obj.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-                    if choices[0].get("finish_reason"):
-                        finish_reason[0] = choices[0].get("finish_reason")
-                    # Reasoning/"thinking" models (e.g. Qwen3) stream their
-                    # chain-of-thought separately from the real answer.
-                    reasoning_piece = delta.get("reasoning_content")
-                    if reasoning_piece:
-                        reasoning_parts.append(reasoning_piece)
-                        ida_kernwin.execute_sync(
-                            functools.partial(self._on_reasoning_delta, reasoning_piece), ida_kernwin.MFF_FAST
-                        )
-                    piece = delta.get("content")
-                    if piece:
-                        parts.append(piece)
-                        ida_kernwin.execute_sync(
-                            functools.partial(self._on_delta, piece), ida_kernwin.MFF_FAST
-                        )
+        try:
+            with self._response as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                if not content_type.startswith("text/event-stream"):
+                    self._handle_non_stream_body(resp.read(), parts, reasoning_parts, finish_reason)
+                else:
+                    for raw_line in resp:
+                        if self._cancel_event.is_set():
+                            return
+                        line = raw_line.decode("utf-8", "replace").strip("\r\n")
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[len("data:"):].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(data_str)
+                        except ValueError:
+                            continue
+                        choices = obj.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta") or {}
+                        if choices[0].get("finish_reason"):
+                            finish_reason[0] = choices[0].get("finish_reason")
+                        # Reasoning/"thinking" models (e.g. Qwen3) stream their
+                        # chain-of-thought separately from the real answer.
+                        reasoning_piece = delta.get("reasoning_content")
+                        if reasoning_piece:
+                            reasoning_parts.append(reasoning_piece)
+                            ida_kernwin.execute_sync(
+                                functools.partial(self._on_reasoning_delta, reasoning_piece), ida_kernwin.MFF_FAST
+                            )
+                        piece = delta.get("content")
+                        if piece:
+                            parts.append(piece)
+                            ida_kernwin.execute_sync(
+                                functools.partial(self._on_delta, piece), ida_kernwin.MFF_FAST
+                            )
+        except (urllib.error.URLError, OSError) as exc:
+            if self._cancel_event.is_set():
+                return
+            raise _ServerConnectionError("Connection to %s lost while streaming (%s)" % (url, exc)) from None
 
         if not self._cancel_event.is_set():
             ida_kernwin.execute_sync(
@@ -989,7 +1044,12 @@ class ConversationRunner(object):
         self.config = config
         self.func = func
         self.func_ea = func.start_ea
-        self.server_url = server_url or config.server_urls[0]
+        # Priority order = config.server_urls list order (first = most
+        # preferred). Snapshotted here so a mid-conversation config change
+        # elsewhere can't shift priorities under an in-flight conversation.
+        self._server_candidates = list(config.server_urls) or list(DEFAULT_CONFIG["server_urls"])
+        self.server_url = server_url or self._server_candidates[0]
+        self._failed_servers = set()
         self.messages = None
         self._on_delta = on_delta or (lambda piece: None)
         self._on_reasoning_delta = on_reasoning_delta or (lambda piece: None)
@@ -1056,10 +1116,37 @@ class ConversationRunner(object):
         )
         self.worker.start()
 
-    def _on_worker_error(self, message):
+    def _next_fallback_server(self):
+        """Highest-priority (list-order) configured server not yet tried
+        this conversation, or None if every configured server has failed.
+        """
+        for candidate in self._server_candidates:
+            if candidate not in self._failed_servers:
+                return candidate
+        return None
+
+    def _on_worker_error(self, message, is_connection_error=False):
         self.worker = None
-        if not self._closed:
-            self._on_error_cb(message)
+        if self._closed:
+            return 0
+        if is_connection_error and len(self._server_candidates) > 1:
+            self._failed_servers.add(self.server_url)
+            next_server = self._next_fallback_server()
+            if next_server is not None:
+                failed_from = self.server_url
+                self.server_url = next_server
+                self._on_status(
+                    "%s is unreachable (%s) - falling back to %s..."
+                    % (self.config.server_label(failed_from), message, self.config.server_label(next_server))
+                )
+                self._issue_request()
+                return 0
+            self._on_error_cb(
+                "None of the %d configured llama-server(s) are reachable. Last error: %s"
+                % (len(self._server_candidates), message)
+            )
+            return 0
+        self._on_error_cb(message)
         return 0
 
     def _on_worker_done(self, full_text, reasoning_text="", finish_reason=None):
@@ -1591,15 +1678,21 @@ class SettingsDialog(QtWidgets.QDialog):
 
         self.server_urls_edit = QtWidgets.QPlainTextEdit()
         self.server_urls_edit.setPlaceholderText(
-            "One llama-server base URL per line, e.g.\nhttp://127.0.0.1:8080\nhttp://127.0.0.1:8081"
+            "One llama-server base URL per line, with an optional # name, e.g.\n"
+            "http://127.0.0.1:8080  # Home GPU\n"
+            "http://127.0.0.1:8081  # Office server"
         )
         self.server_urls_edit.setMaximumHeight(80)
         self.server_urls_edit.setToolTip(
-            "List multiple llama-server instances (one per line) to have "
-            "Batch Explain and the recursive auto-accept action distribute "
-            "work across all of them at once - up to one function in "
-            "flight per server. The interactive single-function explain "
-            "always uses the first URL listed."
+            "List order is priority order, most preferred first. Add an "
+            "optional '# name' after a URL to label it (shown instead of "
+            "the raw URL in status messages and batch results). Batch "
+            "Explain and the recursive auto-accept action distribute work "
+            "across all of them at once (up to one function in flight per "
+            "server); the interactive single-function explain uses the "
+            "first one. If a server refuses/drops a connection or returns "
+            "502/503/504, that conversation automatically retries against "
+            "the next server on the list before giving up."
         )
         form.addRow("Server base URL(s):", self.server_urls_edit)
 
@@ -1722,7 +1815,11 @@ class SettingsDialog(QtWidgets.QDialog):
         self._populate(config)
 
     def _populate(self, config):
-        self.server_urls_edit.setPlainText("\n".join(config.server_urls))
+        lines = []
+        for url in config.server_urls:
+            name = (config.server_names or {}).get(url)
+            lines.append("%s  # %s" % (url, name) if name else url)
+        self.server_urls_edit.setPlainText("\n".join(lines))
         self.model_edit.setText(config.model)
         self.api_key_edit.setText(config.api_key)
         self.temperature_spin.setValue(config.temperature)
@@ -1753,9 +1850,22 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def _on_ok(self):
         cfg = self._base_config.clone()
-        cfg.server_urls = [
-            line.strip() for line in self.server_urls_edit.toPlainText().splitlines() if line.strip()
-        ]
+        server_urls = []
+        server_names = {}
+        for line in self.server_urls_edit.toPlainText().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            url_part, _, name_part = line.partition("#")
+            url_part = url_part.strip()
+            name_part = name_part.strip()
+            if not url_part:
+                continue
+            server_urls.append(url_part)
+            if name_part:
+                server_names[url_part] = name_part
+        cfg.server_urls = server_urls
+        cfg.server_names = server_names
         cfg.model = self.model_edit.text()
         cfg.api_key = self.api_key_edit.text()
         cfg.temperature = self.temperature_spin.value()
@@ -1964,7 +2074,7 @@ class BatchController(object):
         index = self._next_index
         self._next_index += 1
         func = self.funcs[index]
-        self._on_row_update(index, "Running", "(%s)" % server_url)
+        self._on_row_update(index, "Running", "(%s)" % self.config.server_label(server_url))
         runner = ConversationRunner(
             self.config, func, server_url=server_url,
             on_status=functools.partial(self._on_status, index),
@@ -1993,24 +2103,25 @@ class BatchController(object):
 
     def _on_result(self, index, func, server_url, result):
         orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
+        label = self.config.server_label(server_url)
         if result.error:
             item = BatchItemResult(func.start_ea, orig_name, False, result.error,
                                     None, None, None, [], [], None, [], result.root_is_pseudocode)
-            self._on_row_update(index, "Error", result.error)
+            self._on_row_update(index, "Error", "[%s] %s" % (label, result.error))
         else:
             item = BatchItemResult(func.start_ea, orig_name, True, None, result.text,
                                     result.suggested_name, result.suggested_signature,
                                     result.suggested_vars, result.suggested_callee_renames,
                                     result.suggested_struct, result.suggested_var_types,
                                     result.root_is_pseudocode)
-            self._on_row_update(index, "Done", result.text[:120])
+            self._on_row_update(index, "Done", "[%s] %s" % (label, result.text[:120]))
         self._record_and_advance(item, server_url)
 
     def _on_error(self, index, func, server_url, message):
         orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
         item = BatchItemResult(func.start_ea, orig_name, False, message,
                                 None, None, None, [], [], None, [], False)
-        self._on_row_update(index, "Error", message)
+        self._on_row_update(index, "Error", "[%s] %s" % (self.config.server_label(server_url), message))
         self._record_and_advance(item, server_url)
 
 
@@ -2313,7 +2424,11 @@ class LLMExplainerPlugin(idaapi.plugin_t):
 
         ida_kernwin.msg(
             "[%s] v%s loaded. Server(s): %s\n"
-            % (PLUGIN_NAME, PLUGIN_VERSION, ", ".join(self.config.server_urls))
+            % (
+                PLUGIN_NAME,
+                PLUGIN_VERSION,
+                ", ".join(self.config.server_label_full(u) for u in self.config.server_urls),
+            )
         )
         return idaapi.PLUGIN_KEEP
 

@@ -44,10 +44,13 @@ checkbox, editable before anything is written.
   conservative apply defaults as a manual Accept, is capped by its own "Max recursive callees"
   setting, and shows a live, cancellable progress dialog. Use with care since it writes to the
   database unattended.
-- **Multi-server parallelism**: configure more than one `llama-server` instance and batch/recursive
-  explain will run up to one function per server concurrently — N servers gives roughly an Nx
-  speedup over a single server. The interactive single-function explain always uses the first
-  configured server.
+- **Multi-server parallelism with priority + failover**: configure more than one `llama-server`
+  instance (list order = priority) and batch/recursive explain will run up to one function per
+  server concurrently — N servers gives roughly an Nx speedup over a single server. The
+  interactive single-function explain uses the first listed server. Either way, if a server
+  refuses/drops the connection or returns HTTP 502/503/504, that request automatically retries
+  against the next server on the list before giving up, so one offline server doesn't fail your
+  requests.
 
 ## Requirements
 
@@ -139,7 +142,7 @@ Open **Edit → Plugins → LLM Explainer** to configure:
 
 | Setting | Default | Notes |
 |---|---|---|
-| Server base URL(s) | `http://127.0.0.1:8080` | One `llama-server` endpoint per line; batch/recursive explain distributes work across all of them, one function per server at a time |
+| Server base URL(s) | `http://127.0.0.1:8080` | One `llama-server` endpoint per line, in priority order, with an optional `# name` comment (e.g. `http://127.0.0.1:8080  # Home GPU`) shown in status/log messages instead of the raw URL; batch/recursive explain distributes work across all of them concurrently, and any single request automatically falls back to the next server on connection failure |
 | Model name | *(blank)* | Only needed if your server hosts multiple models |
 | API key | *(blank)* | Optional bearer token |
 | Temperature | `0.2` | |
