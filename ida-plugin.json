@@ -1,0 +1,33 @@
+{
+  "$schema": "https://hcli.docs.hex-rays.com/schemas/ida-plugin.json",
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "llm-explainer",
+    "entryPoint": "llm_explainer.py",
+    "version": "1.0.0",
+    "idaVersions": ["9.2"],
+    "description": "Explains functions using a local llama.cpp LLM - proposes renames, types, and structs, all human-reviewed before anything is written.",
+    "license": "MIT",
+    "categories": [
+      "ai"
+    ],
+    "urls": {
+      "repository": "https://github.com/pgarba/ida-llm-explainer"
+    },
+    "authors": [
+      {
+        "name": "Peter Garba"
+      }
+    ],
+    "keywords": [
+      "llm",
+      "llama.cpp",
+      "ai-assistant",
+      "reverse-engineering",
+      "hex-rays",
+      "decompiler",
+      "code-explanation",
+      "function-renaming"
+    ]
+  }
+}

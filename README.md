@@ -1,3 +1,5 @@
+<p align="center"><img src="logo.svg" alt="LLM Explainer logo" width="128"></p>
+
 # LLM Explainer
 
 An IDA Pro 9.2 plugin that asks a locally-running [llama.cpp](https://github.com/ggml-org/llama.cpp)
@@ -63,6 +65,34 @@ Copy `llm_explainer.py` into one of IDA's plugin directories:
   `<IDA install dir>\plugins\llm_explainer.py`
 
 Restart IDA (or reload plugins) afterward.
+
+Alternatively, install via [`hcli`](https://hcli.docs.hex-rays.com/), Hex-Rays' plugin manager,
+using the packaged `ida-plugin.json` described below.
+
+## Packaging (hcli / Hex-Rays plugin repository)
+
+This repo follows the [official plugin packaging format](https://hcli.docs.hex-rays.com/reference/plugin-packaging-and-format/):
+`ida-plugin.json` sits at the repo root next to the entry point (`llm_explainer.py`), which is
+already the flat, single-file layout the format expects — no subfolder needed.
+
+To build the distributable archive:
+
+```sh
+python package.py
+```
+
+This writes `dist/llm-explainer-<version>.zip` with `ida-plugin.json` and `llm_explainer.py` at
+the archive root. Attach that zip as a GitHub release asset — don't rely on GitHub's
+auto-generated "Source code (zip)" link, since it wraps everything in a nested
+`<repo>-<tag>/` folder and would put the manifest one level too deep. Validate with:
+
+```sh
+hcli plugin lint dist/llm-explainer-<version>.zip
+```
+
+Note: `ida-plugin.json`'s `categories` currently lists `"ai"` as a best guess — the docs page
+doesn't publish the full list of accepted category values, so double-check that against
+`hcli plugin lint` (or hcli's own validation) before publishing, and adjust if it's rejected.
 
 ## Usage
 

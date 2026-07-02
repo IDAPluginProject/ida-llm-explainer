@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b1220"/>
+      <stop offset="55%" stop-color="#0f2a3a"/>
+      <stop offset="100%" stop-color="#134155"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5eead4"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+    <radialGradient id="lens" cx="35%" cy="30%" r="80%">
+      <stop offset="0%" stop-color="#163244"/>
+      <stop offset="100%" stop-color="#0a1622"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="0" y="0" width="512" height="512" rx="108" ry="108" fill="url(#bg)"/>
+
+  <!-- subtle code braces flanking the mark -->
+  <text x="50" y="345" font-family="Consolas, 'Courier New', monospace" font-size="300"
+        font-weight="700" fill="#5eead4" opacity="0.16">{</text>
+  <text x="462" y="345" font-family="Consolas, 'Courier New', monospace" font-size="300"
+        font-weight="700" fill="#5eead4" opacity="0.16" text-anchor="end">}</text>
+
+  <!-- magnifying glass handle -->
+  <line x1="306" y1="306" x2="398" y2="398" stroke="url(#ring)" stroke-width="34"
+        stroke-linecap="round"/>
+
+  <!-- magnifying glass lens -->
+  <circle cx="228" cy="228" r="118" fill="url(#lens)" stroke="url(#ring)" stroke-width="26"/>
+
+  <!-- AI sparkle inside the lens -->
+  <polygon points="228.0,182.0 240.0,216.0 274.0,228.0 240.0,240.0 228.0,274.0 216.0,240.0 182.0,228.0 216.0,216.0" fill="#fbbf24"/>
+
+  <!-- small accent sparkle -->
+  <polygon points="404.0,70.0 411.8,92.2 434.0,100.0 411.8,107.8 404.0,130.0 396.2,107.8 374.0,100.0 396.2,92.2" fill="#fbbf24" opacity="0.95"/>
+</svg>
