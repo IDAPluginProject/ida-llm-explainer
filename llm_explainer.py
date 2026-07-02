@@ -41,6 +41,15 @@ To process many functions at once, right-click in the Functions window (or
 use Edit > Plugins > Batch Explain Functions...) to pick a set of functions,
 process them sequentially, and review/apply the results in one batch -
 still nothing is written to the database until you explicitly apply.
+
+"Explain function with LLM (recursively)" (same right-click menu as the
+regular explain action) explains the target function plus its direct
+callees only (depth 1, not deeper), and - unlike every other action in
+this plugin - auto-accepts every result with no review step. It still
+applies the same conservative defaults as a manual Accept (e.g. only
+renaming a function whose name looks auto-generated), the callee count is
+capped by its own "Max recursive callees" setting, and a progress dialog
+stays open so you can watch what happens and cancel mid-run.
 """
 
 import functools
@@ -79,6 +88,7 @@ PLUGIN_VERSION = "1.0.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
+ACTION_ID_EXPLAIN_RECURSIVE = "llm_explainer:explain_recursive"
 CONFIG_FILENAME = "llm_explainer.cfg.json"
 
 
@@ -101,20 +111,31 @@ DEFAULT_SYSTEM_PROMPT = (
     "references (when available), and - depending on settings - the code "
     "of some called functions already included below the target "
     "function.\n\n"
-    "If understanding the target function requires seeing the code of a "
-    "called function that was NOT already included, you MUST request it "
-    "before answering - do not guess or describe the callee generically "
-    "(e.g. as \"a helper function\") when its actual behavior would change "
-    "your answer. This especially applies when the target function calls "
-    "another function whose name looks auto-generated (sub_, loc_, j_ "
-    "followed by a hex address) and whose purpose is not already obvious "
-    "from the strings/globals referenced: in that case, request its code "
-    "first rather than describing it vaguely. To request it, reply with "
+    "Before doing anything else, go through the \"Calls:\" list one "
+    "function at a time. For each one whose name still looks "
+    "auto-generated (sub_, loc_, j_ followed by a hex address) and whose "
+    "code was not already included above, ask yourself honestly: am I "
+    "about to guess its behavior from superficial clues alone - its "
+    "argument count/types, a \"common pattern\" it resembles (e.g. "
+    "assuming a two-argument call like foo(ptr, 16) is \"probably a free\" "
+    "or \"probably a refcount decrement\"), or how similar calls usually "
+    "look in other code - rather than from having actually seen what it "
+    "does? A plausible-sounding guess is still a guess. If so, you MUST "
+    "request that function's code before answering; do not settle for a "
+    "guess just because you already have enough for A plausible-sounding "
+    "answer. This applies to every such call in the function, not just "
+    "the first or most obviously important one - it is common and "
+    "expected to request several functions' code in the same reply when a "
+    "function calls several unclear helpers. To request code, reply with "
     "one or more lines of the exact form\n"
     "REQUEST_CODE: <function name or address>\n"
-    "and nothing else in that reply. You will then be given that function's "
-    "code in a follow-up message and can continue reasoning. Only request "
-    "functions that are actually relevant, and never request the same "
+    "and nothing else in that reply. You will then be given each "
+    "function's code in a follow-up message and can continue reasoning. "
+    "Only skip requesting a call's code when you are already certain what "
+    "it does (e.g. you saw its code earlier this conversation, it is a "
+    "well-known library/CRT function, or its exact behavior genuinely "
+    "would not change your answer, such as a bare logging call) - not "
+    "merely because you have a plausible guess. Never request the same "
     "function twice.\n\n"
     "Once you have enough information, work through ALL FOUR of the "
     "following steps before writing your final answer. These are a "
@@ -150,7 +171,12 @@ DEFAULT_SYSTEM_PROMPT = (
     "SUGGESTED_CALLEE_NAME: <its current name or address> -> <new name>\n"
     "using the same identifier rules as SUGGESTED_NAME. Never for the "
     "target function itself, and never for a function whose code you "
-    "never saw.\n"
+    "never saw: this is enforced automatically, and any "
+    "SUGGESTED_CALLEE_NAME for a function whose code was not actually "
+    "shown to you earlier in this same conversation will be silently "
+    "discarded, so do not bother emitting it in that case - request the "
+    "function's code with REQUEST_CODE first if you want to propose a "
+    "rename for it.\n"
     "4. If the pseudocode accesses memory through a pointer at multiple "
     "constant offsets in a way that suggests an undefined or "
     "generic-looking structure - e.g. *(a1 + 8), *(_DWORD *)(a1 + 0x10), a "
@@ -207,6 +233,7 @@ DEFAULT_CONFIG = {
     "max_string_len": 150,
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "explain_hotkey": "Ctrl-Alt-E",
+    "max_recursive_callees": 10,
 }
 
 ContextBundle = namedtuple("ContextBundle", ["kind", "text"])
@@ -763,6 +790,10 @@ class PluginConfig(object):
             self.max_string_len = max(20, min(2000, int(self.max_string_len)))
         except (TypeError, ValueError):
             self.max_string_len = DEFAULT_CONFIG["max_string_len"]
+        try:
+            self.max_recursive_callees = max(1, min(100, int(self.max_recursive_callees)))
+        except (TypeError, ValueError):
+            self.max_recursive_callees = DEFAULT_CONFIG["max_recursive_callees"]
         self.model = (self.model or "").strip()
         self.api_key = (self.api_key or "").strip()
         self.system_prompt = self.system_prompt or DEFAULT_SYSTEM_PROMPT
@@ -1090,9 +1121,18 @@ class ConversationRunner(object):
             for query, callee_new_name_raw in callee_matches:
                 callee_new_name = sanitize_suggested_name(callee_new_name_raw)
                 if not callee_new_name:
+                    ida_kernwin.msg(
+                        "[%s] Ignored SUGGESTED_CALLEE_NAME for '%s': '%s' "
+                        "is not a valid identifier.\n"
+                        % (PLUGIN_NAME, query, callee_new_name_raw)
+                    )
                     continue
                 callee_func = resolve_function_query(query.strip())
                 if callee_func is None:
+                    ida_kernwin.msg(
+                        "[%s] Ignored SUGGESTED_CALLEE_NAME: could not "
+                        "resolve '%s' to a function.\n" % (PLUGIN_NAME, query)
+                    )
                     continue
                 callee_ea = callee_func.start_ea
                 if callee_ea == self.func_ea or callee_ea in seen_callee_eas:
@@ -1100,11 +1140,29 @@ class ConversationRunner(object):
                 # Only allow renaming functions whose code the model actually
                 # saw (eagerly included or fetched via REQUEST_CODE this
                 # conversation), and only when still under a default name -
-                # never overwrite a name a human already gave it.
+                # never overwrite a name a human already gave it. Both
+                # rejections are logged (rather than silently dropped) since
+                # from the outside "the LLM proposed a name but nothing
+                # happened" looks exactly like a bug otherwise.
                 if callee_ea not in self._fetched_eas:
+                    ida_kernwin.msg(
+                        "[%s] Ignored SUGGESTED_CALLEE_NAME for '%s' -> "
+                        "'%s': the model never actually requested/received "
+                        "this function's code in this conversation, so the "
+                        "rename was not applied. Ask a follow-up (Reason "
+                        "More) telling it to REQUEST_CODE that function "
+                        "first if you want this considered.\n"
+                        % (PLUGIN_NAME, query, callee_new_name)
+                    )
                     continue
                 current_callee_name = ida_funcs.get_func_name(callee_ea) or ("sub_%X" % callee_ea)
                 if not is_auto_generated_name(current_callee_name):
+                    ida_kernwin.msg(
+                        "[%s] Ignored SUGGESTED_CALLEE_NAME for '%s': it "
+                        "already has a non-default name ('%s'); not "
+                        "overwriting it automatically.\n"
+                        % (PLUGIN_NAME, query, current_callee_name)
+                    )
                     continue
                 seen_callee_eas.add(callee_ea)
                 suggested_callee_renames.append((callee_ea, callee_new_name))
@@ -1596,6 +1654,17 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         form.addRow("Max on-demand code requests:", self.max_auto_fetch_spin)
 
+        self.max_recursive_callees_spin = QtWidgets.QSpinBox()
+        self.max_recursive_callees_spin.setRange(1, 100)
+        self.max_recursive_callees_spin.setToolTip(
+            "Cap on how many direct callees 'Explain function with LLM "
+            "(recursively)' will also explain and auto-accept, in addition "
+            "to the target function itself. Kept separate from and smaller "
+            "than 'Max callees listed' since this auto-writes to the "
+            "database without a review step."
+        )
+        form.addRow("Max recursive callees:", self.max_recursive_callees_spin)
+
         self.hotkey_edit = QtWidgets.QLineEdit()
         self.hotkey_edit.setPlaceholderText("e.g. Ctrl-Alt-E (leave blank for none)")
         form.addRow("Explain hotkey:", self.hotkey_edit)
@@ -1638,6 +1707,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.follow_calls_spin.setValue(config.follow_calls_depth)
         self.max_total_context_spin.setValue(config.max_total_context_chars)
         self.max_auto_fetch_spin.setValue(config.max_auto_fetch)
+        self.max_recursive_callees_spin.setValue(config.max_recursive_callees)
         self.hotkey_edit.setText(config.explain_hotkey)
         self.system_prompt_edit.setPlainText(config.system_prompt)
 
@@ -1668,6 +1738,7 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.follow_calls_depth = self.follow_calls_spin.value()
         cfg.max_total_context_chars = self.max_total_context_spin.value()
         cfg.max_auto_fetch = self.max_auto_fetch_spin.value()
+        cfg.max_recursive_callees = self.max_recursive_callees_spin.value()
         cfg.explain_hotkey = self.hotkey_edit.text().strip()
         cfg.system_prompt = self.system_prompt_edit.toPlainText()
         cfg._validate()
@@ -1783,6 +1854,25 @@ BatchItemResult = namedtuple("BatchItemResult", [
 ])
 
 
+def _compute_apply_args(item):
+    """Given a BatchItemResult, compute the positional args tuple for
+    _apply_suggestions_and_refresh, using the same conservative defaults
+    used throughout the plugin (rename only when the current name looks
+    auto-generated; signature/variable/struct suggestions only when the
+    root context was Hex-Rays pseudocode). Returns None if there's nothing
+    to apply (missing or failed result).
+    """
+    if item is None or not item.ok:
+        return None
+    new_name = item.suggested_name if (item.suggested_name and is_auto_generated_name(item.orig_name)) else None
+    signature = item.suggested_signature if item.root_is_pseudocode else None
+    var_renames = item.suggested_vars if (item.root_is_pseudocode and item.suggested_vars) else None
+    callee_renames = item.suggested_callee_renames or None
+    struct_decl = item.suggested_struct if item.root_is_pseudocode else None
+    var_types = item.suggested_var_types if (item.root_is_pseudocode and item.suggested_var_types) else None
+    return (item.func_ea, item.comment, new_name, signature, var_renames, callee_renames, struct_decl, var_types)
+
+
 class BatchController(object):
     """Drives a sequence of ConversationRunners, one function at a time, on
     IDA's main thread. No separate background thread is needed:
@@ -1793,11 +1883,12 @@ class BatchController(object):
     once invoked, starts the next function.
     """
 
-    def __init__(self, config, funcs, on_row_update, on_finished):
+    def __init__(self, config, funcs, on_row_update, on_finished, on_item_result=None):
         self.config = config
         self.funcs = funcs
         self._on_row_update = on_row_update
         self._on_finished = on_finished
+        self._on_item_result = on_item_result or (lambda item: None)
         self._index = 0
         self._cancelled = False
         self._runner = None
@@ -1848,6 +1939,7 @@ class BatchController(object):
 
     def _record_and_advance(self, item):
         self.results[item.func_ea] = item
+        self._on_item_result(item)
         self._runner = None
         self._index += 1
         self._process_next()
@@ -1889,28 +1981,44 @@ def _apply_batch_and_refresh(items):
 
 class BatchProgressDialog(QtWidgets.QDialog):
     """Table: [Apply checkbox | Function | Status | Comment/Error preview].
-    Never auto-writes - always Cancel-while-running, then an
-    Apply-Selected-after-review step, matching the plugin's
-    human-in-the-loop philosophy used everywhere else. No "Reason More" in
-    batch mode - close this dialog and use the interactive single-function
-    dialog to refine any one function further.
+
+    Two modes:
+    - auto_apply=False (default, used by "Batch Explain Functions..."):
+      never auto-writes - Cancel-while-running, then an Apply-Selected-
+      after-review step, matching the plugin's human-in-the-loop
+      philosophy used everywhere else.
+    - auto_apply=True (used by "Explain function with LLM (recursively)"):
+      each function's suggestions are applied automatically the moment
+      that function finishes, with the same conservative defaults the
+      manual Apply Selected step uses (see _compute_apply_args) - no
+      per-item review, but this dialog still shows live progress and can
+      be cancelled mid-run, and the Apply column becomes a read-only
+      "Applied" indicator rather than a checkbox.
+
+    No "Reason More" in either mode - close this dialog and use the
+    interactive single-function dialog to refine any one function further.
     """
 
     COL_APPLY, COL_FUNC, COL_STATUS, COL_PREVIEW = range(4)
 
-    def __init__(self, config, funcs, parent=None):
+    def __init__(self, config, funcs, parent=None, auto_apply=False):
         super().__init__(parent)
-        self.setWindowTitle("%s - Batch Explain Progress" % PLUGIN_NAME)
+        self.auto_apply = auto_apply
+        title = "Recursive Explain (auto-accept)" if auto_apply else "Batch Explain Progress"
+        self.setWindowTitle("%s - %s" % (PLUGIN_NAME, title))
         self.resize(720, 480)
         self.funcs = funcs
+        self._row_by_ea = {f.start_ea: i for i, f in enumerate(funcs)}
 
         self.table = QtWidgets.QTableWidget(len(funcs), 4)
-        self.table.setHorizontalHeaderLabels(["Apply", "Function", "Status", "Comment / Error"])
+        apply_header = "Applied" if auto_apply else "Apply"
+        self.table.setHorizontalHeaderLabels([apply_header, "Function", "Status", "Comment / Error"])
         self.table.horizontalHeader().setStretchLastSection(True)
         for i, func in enumerate(funcs):
             name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
             check_item = QtWidgets.QTableWidgetItem()
-            check_item.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            if not auto_apply:
+                check_item.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable)
             check_item.setCheckState(QtCore.Qt.CheckState.Unchecked)
             self.table.setItem(i, self.COL_APPLY, check_item)
             self.table.setItem(i, self.COL_FUNC, QtWidgets.QTableWidgetItem("%s @ %#x" % (name, func.start_ea)))
@@ -1922,6 +2030,8 @@ class BatchProgressDialog(QtWidgets.QDialog):
         self.apply_button = QtWidgets.QPushButton("Apply Selected")
         self.apply_button.setEnabled(False)
         self.apply_button.clicked.connect(self._apply_selected)
+        if auto_apply:
+            self.apply_button.setVisible(False)
         self.close_button = QtWidgets.QPushButton("Close")
         self.close_button.clicked.connect(self.close)
 
@@ -1936,7 +2046,10 @@ class BatchProgressDialog(QtWidgets.QDialog):
         layout.addLayout(button_row)
         _add_copyright_footer(layout)
 
-        self.controller = BatchController(config, funcs, self._on_row_update, self._on_batch_finished)
+        self.controller = BatchController(
+            config, funcs, self._on_row_update, self._on_batch_finished,
+            on_item_result=self._on_item_auto_apply if auto_apply else None,
+        )
         self.controller.start()
 
     def _on_row_update(self, index, status, preview):
@@ -1944,8 +2057,23 @@ class BatchProgressDialog(QtWidgets.QDialog):
         if preview:
             self.table.item(index, self.COL_PREVIEW).setText(preview)
 
+    def _on_item_auto_apply(self, item):
+        args = _compute_apply_args(item)
+        if args is not None:
+            ida_kernwin.execute_sync(
+                functools.partial(_apply_suggestions_and_refresh, *args), ida_kernwin.MFF_WRITE
+            )
+        row = self._row_by_ea.get(item.func_ea)
+        if row is not None:
+            check_item = self.table.item(row, self.COL_APPLY)
+            check_item.setCheckState(
+                QtCore.Qt.CheckState.Checked if args is not None else QtCore.Qt.CheckState.Unchecked
+            )
+
     def _on_batch_finished(self):
         self.cancel_button.setEnabled(False)
+        if self.auto_apply:
+            return
         for i, func in enumerate(self.funcs):
             item = self.controller.results.get(func.start_ea)
             check_item = self.table.item(i, self.COL_APPLY)
@@ -1964,21 +2092,9 @@ class BatchProgressDialog(QtWidgets.QDialog):
         for i, func in enumerate(self.funcs):
             if self.table.item(i, self.COL_APPLY).checkState() != QtCore.Qt.CheckState.Checked:
                 continue
-            item = self.controller.results.get(func.start_ea)
-            if item is None or not item.ok:
-                continue
-            new_name = None
-            if item.suggested_name and is_auto_generated_name(item.orig_name):
-                new_name = item.suggested_name
-            signature = item.suggested_signature if item.root_is_pseudocode else None
-            var_renames = item.suggested_vars if (item.root_is_pseudocode and item.suggested_vars) else None
-            callee_renames = item.suggested_callee_renames or None
-            struct_decl = item.suggested_struct if item.root_is_pseudocode else None
-            var_types = item.suggested_var_types if (item.root_is_pseudocode and item.suggested_var_types) else None
-            items_to_apply.append(
-                (item.func_ea, item.comment, new_name, signature, var_renames, callee_renames,
-                 struct_decl, var_types)
-            )
+            args = _compute_apply_args(self.controller.results.get(func.start_ea))
+            if args is not None:
+                items_to_apply.append(args)
         if not items_to_apply:
             return
         ida_kernwin.execute_sync(
@@ -2018,6 +2134,35 @@ class ExplainActionHandler(ida_kernwin.action_handler_t):
         return ida_kernwin.AST_ENABLE_FOR_WIDGET if _resolve_func(ctx) else ida_kernwin.AST_DISABLE_FOR_WIDGET
 
 
+class ExplainRecursiveActionHandler(ida_kernwin.action_handler_t):
+    """Explains the target function plus its direct (depth-1 only)
+    callees, and auto-accepts every result - no per-function review step,
+    unlike every other action in this plugin. See LLMExplainerPlugin.
+    open_recursive_explain for the safety gating this still applies.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def activate(self, ctx):
+        func = _resolve_func(ctx)
+        if not func:
+            ida_kernwin.warning("Place the cursor inside a function first.")
+            return 0
+        plugin = LLMExplainerPlugin.instance
+        if plugin is None:
+            return 0
+        plugin.open_recursive_explain(func)
+        return 1
+
+    def update(self, ctx):
+        widget = getattr(ctx, "widget", None)
+        wtype = ida_kernwin.get_widget_type(widget) if widget else -1
+        if wtype not in (ida_kernwin.BWN_PSEUDOCODE, ida_kernwin.BWN_DISASM):
+            return ida_kernwin.AST_DISABLE_FOR_WIDGET
+        return ida_kernwin.AST_ENABLE_FOR_WIDGET if _resolve_func(ctx) else ida_kernwin.AST_DISABLE_FOR_WIDGET
+
+
 class BatchActionHandler(ida_kernwin.action_handler_t):
     def __init__(self):
         super().__init__()
@@ -2045,6 +2190,7 @@ class PopupHooks(ida_kernwin.UI_Hooks):
         wtype = ida_kernwin.get_widget_type(widget)
         if wtype in (ida_kernwin.BWN_PSEUDOCODE, ida_kernwin.BWN_DISASM):
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN_RECURSIVE, "LLM Explainer/")
         elif wtype == ida_kernwin.BWN_FUNCS:
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_BATCH, "LLM Explainer/")
 
@@ -2055,8 +2201,12 @@ class LLMExplainerPlugin(idaapi.plugin_t):
     help = (
         "Right-click a function in the disassembly or pseudocode view (or "
         "use the configured hotkey) to ask the configured llama.cpp server "
-        "to explain it. Right-click in the Functions window to batch-explain "
-        "multiple functions. Edit > Plugins > LLM Explainer opens settings."
+        "to explain it. The same menu also has 'Explain function with LLM "
+        "(recursively)', which additionally explains the function's direct "
+        "callees and automatically applies every result without a review "
+        "step - use with care. Right-click in the Functions window to "
+        "batch-explain multiple functions. Edit > Plugins > LLM Explainer "
+        "opens settings."
     )
     wanted_name = PLUGIN_NAME
     wanted_hotkey = ""
@@ -2068,6 +2218,7 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         self.config = PluginConfig.load()
         self._open_dialogs = []
         self._action_handler = ExplainActionHandler()
+        self._recursive_action_handler = ExplainRecursiveActionHandler()
         self._batch_action_handler = BatchActionHandler()
 
         action = ida_kernwin.action_desc_t(
@@ -2080,6 +2231,18 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         )
         if not ida_kernwin.register_action(action):
             ida_kernwin.msg("[%s] Failed to register action.\n" % PLUGIN_NAME)
+
+        recursive_action = ida_kernwin.action_desc_t(
+            ACTION_ID_EXPLAIN_RECURSIVE,
+            "Explain function with LLM (recursively)...",
+            self._recursive_action_handler,
+            None,
+            "Also explain this function's direct callees (depth 1) and "
+            "auto-accept every result without a review step",
+            -1,
+        )
+        if not ida_kernwin.register_action(recursive_action):
+            ida_kernwin.msg("[%s] Failed to register recursive action.\n" % PLUGIN_NAME)
 
         batch_action = ida_kernwin.action_desc_t(
             ACTION_ID_BATCH,
@@ -2145,6 +2308,10 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         except Exception:
             pass
         try:
+            ida_kernwin.unregister_action(ACTION_ID_EXPLAIN_RECURSIVE)
+        except Exception:
+            pass
+        try:
             ida_kernwin.unregister_action(ACTION_ID_BATCH)
         except Exception:
             pass
@@ -2170,6 +2337,22 @@ class LLMExplainerPlugin(idaapi.plugin_t):
 
     def open_batch_dialog(self, funcs):
         dlg = BatchProgressDialog(self.config, funcs)
+        return self._track_dialog(dlg)
+
+    def open_recursive_explain(self, func):
+        """Target function plus its direct callees only (depth 1 - callees
+        of callees are not included), each explained and auto-applied.
+        Capped by config.max_recursive_callees, deliberately a smaller,
+        separate setting from max_callees since this writes to the
+        database automatically."""
+        callees = gather_callee_funcs(func, self.config.max_recursive_callees)
+        funcs = [func]
+        seen_eas = {func.start_ea}
+        for callee in callees:
+            if callee.start_ea not in seen_eas:
+                seen_eas.add(callee.start_ea)
+                funcs.append(callee)
+        dlg = BatchProgressDialog(self.config, funcs, auto_apply=True)
         return self._track_dialog(dlg)
 
 

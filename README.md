@@ -30,6 +30,12 @@ non-modal review dialog. Nothing is written to your database until you explicitl
 - **Batch mode**: pick a set of functions (filterable checklist), process them sequentially, then
   review and apply the results in bulk — same human-in-the-loop guarantee as the single-function
   flow.
+- **Recursive auto-accept mode**: `Explain function with LLM (recursively)` also explains the
+  target function's direct callees (depth 1 only) and applies every result automatically, with
+  no review step — the one exception to the human-in-the-loop rule above. Still uses the same
+  conservative apply defaults as a manual Accept, is capped by its own "Max recursive callees"
+  setting, and shows a live, cancellable progress dialog. Use with care since it writes to the
+  database unattended.
 
 ## Requirements
 
@@ -76,6 +82,15 @@ Restart IDA (or reload plugins) afterward.
    **Apply Selected** to write all of them in one batch. There is no follow-up chat in batch
    mode — reopen the single-function flow on a specific function if you want to refine it further.
 
+### Recursive auto-accept
+
+Right-click a function → **LLM Explainer → Explain function with LLM (recursively)...**. This
+explains the target function plus its direct callees (depth 1 only — callees of callees are not
+included), and applies every successful result immediately as it completes, with no per-function
+review. A progress dialog still shows live status and can be cancelled mid-run; the callee count
+is capped by the separate "Max recursive callees" setting (default `10`) precisely because this
+mode writes to the database unattended.
+
 ## Configuration
 
 Open **Edit → Plugins → LLM Explainer** to configure:
@@ -97,6 +112,7 @@ Open **Edit → Plugins → LLM Explainer** to configure:
 | Follow calls depth | `0` | `0` = target function only; `N>0` eagerly includes N levels of callee code |
 | Max total context chars | `40000` | Overall budget when following calls |
 | Max on-demand code requests | `5` | Cap on automatic `REQUEST_CODE` round-trips per conversation |
+| Max recursive callees | `10` | Cap on direct callees processed by the recursive auto-accept action |
 | Explain hotkey | `Ctrl-Alt-E` | |
 | System prompt | *(editable)* | Governs the whole protocol below |
 
