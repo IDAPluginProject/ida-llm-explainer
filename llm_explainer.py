@@ -155,7 +155,7 @@ CONFIG_FILENAME = "llm_explainer.cfg.json"
 
 
 def _add_copyright_footer(layout):
-    label = QtWidgets.QLabel(PLUGIN_COPYRIGHT)
+    label = QtWidgets.QLabel("%s v%s - %s" % (PLUGIN_NAME, PLUGIN_VERSION, PLUGIN_COPYRIGHT))
     label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
     font = label.font()
     font.setPointSize(max(7, font.pointSize() - 2))
