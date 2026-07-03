@@ -51,6 +51,26 @@ checkbox, editable before anything is written.
   refuses/drops the connection or returns HTTP 502/503/504, that request automatically retries
   against the next server on the list before giving up, so one offline server doesn't fail your
   requests.
+- **LLM-guided CFG recovery for obfuscated functions**: right-click in the disassembly view →
+  **Trace/Recover CFG...**, give it a start address, and it walks the function's basic blocks
+  forward — auto-continuing through anything with a single successor, and at each real branch
+  or indirect-jump decision point first trying a fast, deterministic constant-propagation pass
+  (x86/x64 only) before ever asking the model. That pass resolves classic opaque predicates (a
+  dispatcher/state variable set to a known constant earlier in the trace — one side real, the
+  other dead) and also recognizes genuine data-dependent branches — a comparison against an
+  incoming argument, something read through one, or a called function's result — as ordinary,
+  non-obfuscated conditional logic, marking every side real automatically without needing to
+  know what the argument/call result actually contains; only when it can't confidently resolve
+  something does it fall back to the LLM,
+  so LLM calls stay proportional to actual obfuscation complexity rather than every branch in
+  the function. As it walks it also corrects any instruction boundaries IDA's original analysis
+  got wrong (undefine + recreate, never touching a byte — the same fixup you'd do by hand with
+  U then C), since obfuscated code routinely has real jump targets landing mid-instruction
+  relative to IDA's initial linear-sweep guess; this happens immediately, not deferred to
+  Accept. A live, cancellable transcript shows progress; once the trace finishes (or a
+  configurable block-count safety cap is hit), a review table lets you check/uncheck each
+  decided block before Accept. The REAL/DEAD/UNRESOLVED verdicts themselves only color the
+  disassembly and add a comment — no byte patching, NOPing, or branch rewriting.
 
 ## Requirements
 
@@ -136,6 +156,41 @@ review. A progress dialog still shows live status and can be cancelled mid-run; 
 is capped by the separate "Max recursive callees" setting (default `10`) precisely because this
 mode writes to the database unattended.
 
+### Trace/Recover CFG (obfuscated functions)
+
+1. In the **disassembly view**, put the cursor on the function's entry point (or any address
+   you want to start from) and right-click → **LLM Explainer → Trace/Recover CFG...**.
+2. Confirm or edit the start address, then click **Start**.
+3. Watch the live transcript as it walks basic blocks, auto-continuing through single-successor
+   blocks and, at each real branch/indirect jump, first trying to resolve it automatically via
+   constant propagation before ever pausing for an LLM round-trip. As it walks it also fixes up
+   any instruction boundaries IDA's original analysis got wrong (undefine + recreate, no bytes
+   changed) — this happens immediately, since it's just correcting IDA's own analysis, not an
+   LLM opinion. **Cancel** at any time; any boundary fixes already made stay (they're harmless
+   corrections either way), but no REAL/DEAD/UNRESOLVED coloring/comments are written until you
+   explicitly accept in step 4.
+4. Once the worklist empties (or the "Max CFG trace blocks" cap is hit, producing a partial
+   result), review the table of every decided/flagged block — verdict REAL/DEAD/UNRESOLVED, with
+   a reason (rows resolved automatically are prefixed `[symbolic]`) — check/uncheck rows, and
+   click **Accept & Mark Disassembly**. This only colors the affected instructions and adds a
+   one-line comment on each block's first instruction; it never patches bytes.
+
+Blocks the model never gave a verdict for, addresses it invented outside the actual candidates,
+and conflicting REAL/DEAD verdicts for the same address reached from different paths are all
+surfaced as UNRESOLVED rather than silently resolved one way or the other, so you can just
+review those manually rather than trust a guess. The same applies to the constant-propagation
+pass: it only ever resolves a branch when it's actually confident (a concrete value it computed,
+or a value it can positively attribute to runtime/caller data) — anything it isn't sure about
+still falls back to the LLM rather than guessing.
+
+**Constant-propagation pass limitations** (falls back to the LLM for these, same as if the
+feature were off): x86/x64 only; no indexed/scaled memory addressing (`[rcx+rdx*4]` — only
+simple `[reg+disp]`); state isn't tracked across `call` instructions (a full, conservative
+reset); only `mov`/`movzx`/`movsx(d)`/`lea`/`add`/`sub`/`and`/`or`/`xor`/`not`/`neg`/`inc`/`dec`/
+`shl`/`shr`/`sar`/`cmp`/`test`/`push`/`pop`/`nop` are modeled — anything else resets tracking for
+that path. Disable "Resolve CFG trace branches via constant propagation" in Settings to force
+every decision point through the LLM as before.
+
 ## Configuration
 
 Open **Edit → Plugins → LLM Explainer** to configure:
@@ -160,6 +215,10 @@ Open **Edit → Plugins → LLM Explainer** to configure:
 | Max recursive callees | `10` | Cap on direct callees processed by the recursive auto-accept action |
 | Explain hotkey | `Ctrl-Alt-E` | |
 | System prompt | *(editable)* | Governs the whole protocol below |
+| Max CFG trace blocks | `200` | Safety cap on blocks decoded per CFG trace run; hitting it stops with a partial result |
+| Resolve CFG trace branches via constant propagation | on | Tries a fast, deterministic symbolic pass (x86/x64 only) before asking the LLM at each decision point; disable to always ask the LLM |
+| CFG trace colors | green / red / amber | Disassembly background colors for REAL / DEAD / UNRESOLVED blocks (`#RRGGBB`) |
+| CFG trace system prompt | *(editable)* | Governs the REAL_TARGET/DEAD_TARGET/UNRESOLVED_TARGET protocol used by CFG tracing |
 
 A **Restore Defaults** button resets the form (not saved until you click OK). Settings persist
 as JSON under your IDA user directory (`llm_explainer.cfg.json`).

@@ -58,6 +58,42 @@ applies the same conservative defaults as a manual Accept (e.g. only
 renaming a function whose name looks auto-generated), the callee count is
 capped by its own "Max recursive callees" setting, and a progress dialog
 stays open so you can watch what happens and cancel mid-run.
+
+"Trace/Recover CFG..." (disassembly view only, since the whole point is a
+blob that may not even be recognized as a function) walks an obfuscated
+function's basic blocks forward from a given start address - the kind
+produced by control-flow flattening around a dispatcher, opaque
+predicates, or decoy blocks. It auto-continues through anything with a
+single successor, and at each genuine decision point (conditional
+branches, indirect jumps/switch dispatchers) first tries a lightweight,
+deterministic symbolic-execution pass (x86/x64 only: constant
+register/stack-slot tracking through mov/lea/arithmetic/cmp/test) to
+resolve it WITHOUT an LLM call - this covers both classic opaque
+predicates (a dispatcher/state variable set to a known constant earlier
+in the trace) and genuine data-dependent branches (a comparison against
+caller-supplied/runtime data, which is ordinary conditional logic, not
+obfuscation - every side gets marked real automatically). Only when this
+cannot confidently resolve something does it fall back to asking the
+LLM, showing a live, cancellable transcript throughout, until the
+worklist is empty or the configured block cap is hit. Several structural
+defenses (not just prompt wording) further guard against known LLM
+failure modes for whatever still reaches it: a candidate the model never
+addresses is flagged for manual review rather than silently assumed dead,
+an address outside the block's actual candidates is discarded, and
+conflicting REAL/DEAD verdicts for the same address from different paths
+keep the first verdict and surface the conflict. As it walks, it also
+corrects any instruction boundaries IDA's original analysis got wrong -
+undefining and recreating instructions one at a time (never touching a
+byte), the same "U then C" fixup a human would do manually - since
+obfuscated code routinely has real jump targets landing mid-instruction
+relative to IDA's initial linear-sweep guess; this happens immediately
+as part of walking, not deferred to Accept, since it is just correcting
+IDA's own analysis rather than expressing an LLM opinion. Once the trace
+finishes, a review table lets you check/uncheck each decided block before
+Accept - v1 only colors the disassembly and adds a comment for the
+REAL/DEAD/UNRESOLVED verdicts themselves (no byte patching, no NOPing
+dead code, no branch rewriting), matching this plugin's human-in-the-loop
+rule.
 """
 
 import functools
@@ -67,16 +103,22 @@ import re
 import threading
 import urllib.error
 import urllib.request
-from collections import namedtuple
+from collections import deque, namedtuple
 
 import idaapi
 import idautils
 import idc
 import ida_kernwin
+import ida_bytes
 import ida_funcs
+import ida_idp
 import ida_lines
 import ida_name
+import ida_nalt
+import ida_segment
 import ida_typeinf
+import ida_ua
+import ida_xref
 
 try:
     import ida_hexrays
@@ -97,6 +139,7 @@ PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
 ACTION_ID_EXPLAIN_RECURSIVE = "llm_explainer:explain_recursive"
+ACTION_ID_TRACE_CFG = "llm_explainer:trace_cfg"
 CONFIG_FILENAME = "llm_explainer.cfg.json"
 
 
@@ -223,6 +266,105 @@ DEFAULT_SYSTEM_PROMPT = (
     "at greater length."
 )
 
+CFG_TRACE_SYSTEM_PROMPT = (
+    "You are an expert reverse engineer helping recover the original control "
+    "flow of a function that has been deliberately obfuscated (e.g. control-"
+    "flow flattening around a dispatcher/state variable, opaque predicates "
+    "where only one side of a conditional branch is ever really reachable, "
+    "or decoy/junk basic blocks that are never actually executed).\n\n"
+    "You will be shown ONE basic block at a time - its disassembly, and the "
+    "path taken to reach it so far (the earlier blocks and which choice was "
+    "made at each branch) - followed by a numbered list of every candidate "
+    "successor address IDA found for its final instruction. Your job is to "
+    "decide, for THIS block only, which of its candidates are the real "
+    "continuation of the original program and which are fake/dead.\n\n"
+    "Follow this checklist for every block:\n"
+    "1. Address every single candidate listed - do not silently ignore one "
+    "just because another looks obviously correct. A block with two "
+    "candidates needs two verdicts, not one.\n"
+    "2. Reason from concrete state established earlier in the trace (e.g. "
+    "the actual value assigned to a dispatcher/state variable a few blocks "
+    "back, or a comparison result you can actually work out) - not from "
+    "surface-level mnemonic pattern-guessing or assuming a branch is real "
+    "just because it 'looks like normal code'.\n"
+    "3. Before deciding, ask yourself WHY this condition's outcome is or "
+    "isn't fixed. There are two fundamentally different situations, and "
+    "you must tell them apart:\n"
+    "   a) OPAQUE PREDICATE - the condition's outcome is fully determined "
+    "by state the obfuscator itself established earlier in this exact "
+    "trace (a dispatcher/state variable set to a known constant a few "
+    "blocks back, a comparison against a value you can concretely work "
+    "out). Exactly one side is ever really reachable - mark that "
+    "candidate REAL and the other(s) DEAD.\n"
+    "   b) GENUINE DATA-DEPENDENT BRANCH - the condition depends on "
+    "something that is legitimately variable at runtime and was never "
+    "fixed by this trace: a function argument, a field read from a "
+    "pointer passed in by the caller, a global whose value this "
+    "obfuscation does not control, external input, etc. This is NOT "
+    "obfuscation - it is ordinary conditional logic from the original "
+    "program (e.g. a bounds check, a dispatch on caller-supplied input), "
+    "and the original control flow genuinely takes EITHER path depending "
+    "on the input. In this situation mark EVERY candidate REAL. The fact "
+    "that you personally cannot compute which side is taken from static "
+    "analysis alone is not evidence that one side is dead - it is "
+    "evidence that both sides are real and input-dependent, which is the "
+    "normal, expected shape of most real conditionals. Do not fall back "
+    "to UNRESOLVED_TARGET just because the value isn't statically known.\n"
+    "4. For an indirect jump through a dispatcher table, work out the "
+    "actual state value reaching this point if you can, rather than "
+    "assuming any one case is reachable by default. If the dispatch value "
+    "itself is genuinely data-dependent (case (b) above) rather than a "
+    "fixed obfuscator-controlled state, mark every enumerated case REAL.\n"
+    "5. Never invent an address that is not one of the listed candidates. "
+    "The only exception is an indirect jump explicitly marked as having no "
+    "enumerable candidates - only then may you name a specific address you "
+    "can justify from the trace.\n\n"
+    "Reply using exactly one line per candidate, in one of these three "
+    "forms:\n"
+    "REAL_TARGET: <address> - <short reason>\n"
+    "DEAD_TARGET: <address> - <short reason>\n"
+    "UNRESOLVED_TARGET: <address or \"indirect\"> - <short reason>\n"
+    "Reserve UNRESOLVED_TARGET for genuine ambiguity you cannot resolve "
+    "either way - e.g. an indirect jump with no enumerable candidates at "
+    "all, or evidence that is actually contradictory - not for an "
+    "ordinary data-dependent branch (see 3b above, which is REAL on every "
+    "side, not UNRESOLVED) and not merely because a value isn't a fixed "
+    "compile-time constant. Use plain addresses (e.g. 0x1400012A0), "
+    "matching one of the candidates shown to you. Do not include any "
+    "other text in your reply.\n\n"
+    "Worked example 1 (opaque predicate) - a block ending in a conditional "
+    "jump with candidates 0x140001050 (jump taken) and 0x140001058 "
+    "(fallthrough), where the trace shows a state variable was just set to "
+    "3 and this block compares it against 3:\n"
+    "REAL_TARGET: 0x140001050 - state variable equals 3, so this comparison "
+    "is always true and the jump is always taken\n"
+    "DEAD_TARGET: 0x140001058 - fallthrough is never reached since the "
+    "comparison above always succeeds\n\n"
+    "Worked example 2 (genuine data-dependent branch, NOT obfuscation) - a "
+    "block computes eax from dword ptr [rcx+18h] (a field of the struct "
+    "pointer passed into this function as an argument), then does\n"
+    "cmp eax, 4Dh\n"
+    "ja short loc_140A7D045\n"
+    "with candidates loc_140A7D045 (jump taken) and the fallthrough block. "
+    "Nothing earlier in the trace fixes [rcx+18h] to a known constant - it "
+    "is caller-supplied input, so this is an ordinary bounds/range check "
+    "from the original program, not an opaque predicate:\n"
+    "REAL_TARGET: <fallthrough address> - depends on the caller-supplied "
+    "value at [rcx+18h]; this is a genuine range check, not a fixed "
+    "obfuscator predicate, so both outcomes are real\n"
+    "REAL_TARGET: <loc_140A7D045 address> - same reasoning; taken when the "
+    "caller-supplied value is out of range\n\n"
+    "WRONG example (do not do this) - replying with only\n"
+    "REAL_TARGET: 0x140001050 - looks like the normal path\n"
+    "and leaving 0x140001058 unaddressed. Every candidate must get its own "
+    "verdict line, even when you are confident about the other one. It is "
+    "equally wrong to mark a genuine data-dependent branch (worked example "
+    "2) as UNRESOLVED just because you cannot compute the runtime value - "
+    "that pattern (a comparison against something read from an argument, "
+    "with no earlier fixed state controlling it) should be recognized as "
+    "case 3b and both sides marked REAL."
+)
+
 DEFAULT_CONFIG = {
     "server_urls": ["http://127.0.0.1:8080"],
     "server_names": {},
@@ -243,6 +385,12 @@ DEFAULT_CONFIG = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "explain_hotkey": "Ctrl-Alt-E",
     "max_recursive_callees": 10,
+    "max_trace_blocks": 200,
+    "cfg_trace_color_real": 0x99FF99,
+    "cfg_trace_color_dead": 0x9999FF,
+    "cfg_trace_color_unresolved": 0x99E0FF,
+    "cfg_trace_system_prompt": CFG_TRACE_SYSTEM_PROMPT,
+    "cfg_trace_use_symbolic": True,
 }
 
 ContextBundle = namedtuple("ContextBundle", ["kind", "text"])
@@ -264,6 +412,10 @@ _SUGGESTED_STRUCT_RE = re.compile(r"(?im)^\s*SUGGESTED_STRUCT:\s*(.+?)\s*$")
 _SUGGESTED_VAR_TYPE_RE = re.compile(r"(?im)^\s*SUGGESTED_VAR_TYPE:\s*([A-Za-z_]\w*)\s+(.+?)\s*$")
 _VALID_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 _AUTO_NAME_RE = re.compile(r"^(sub|loc|nullsub|j_sub|j_nullsub)_[0-9A-Fa-f]+$")
+
+_REAL_TARGET_RE = re.compile(r"(?im)^\s*REAL_TARGET:\s*(\S+)(?:\s*-\s*(.*?))?\s*$")
+_DEAD_TARGET_RE = re.compile(r"(?im)^\s*DEAD_TARGET:\s*(\S+)(?:\s*-\s*(.*?))?\s*$")
+_UNRESOLVED_TARGET_RE = re.compile(r"(?im)^\s*UNRESOLVED_TARGET:\s*(\S+)(?:\s*-\s*(.*?))?\s*$")
 
 
 def sanitize_suggested_name(name):
@@ -705,6 +857,898 @@ def _apply_suggestions_and_refresh(
 
 
 # ---------------------------------------------------------------------------
+# CFG trace: basic-block extraction (disassembly-level, no Hex-Rays needed)
+# ---------------------------------------------------------------------------
+
+# role: "jump_target" (explicit direct branch target) | "fallthrough" |
+# "case" (jump-table case, case_values set) | "unresolved" (indirect jump
+# whose targets IDA could not enumerate - ea is None in that case).
+BlockSuccessor = namedtuple("BlockSuccessor", ["ea", "role", "case_values", "note"])
+
+# kind: "return" | "unconditional_jump" | "conditional_branch" |
+# "indirect_jump" | "undecodable" | "truncated" (hit the internal
+# max_instrs safety valve without reaching a block-ending instruction).
+BlockInfo = namedtuple(
+    "BlockInfo",
+    ["start_ea", "end_ea", "text", "kind", "successors", "last_insn_ea", "insn_eas", "sym_insns"],
+)
+
+# Internal safety valve against a decode desync (e.g. walking into data)
+# turning into a runaway loop. Not user-configurable - hitting it always
+# means "something is wrong here", not "this is a big block".
+_MAX_BLOCK_INSTRS = 300
+
+
+def _fixup_instruction_boundary(ea, expected_size):
+    """Ensures IDA has a correctly-bounded, freshly-analyzed instruction
+    item at ea, undefining and recreating it if IDA's existing analysis
+    disagrees with what decode_insn (a pure "interpret these raw bytes"
+    call that never touches the database) just found. Never changes a
+    single byte - only item boundaries/metadata, exactly like manually
+    pressing U then C.
+
+    This is not just cosmetic: obfuscated code routinely has real jump
+    targets that land mid-instruction relative to IDA's original (wrong)
+    linear-sweep disassembly. Besides the disassembly text being
+    misleading there, idautils.CodeRefsFrom (used below to resolve branch
+    targets) reads cross-references stored in the database, which are
+    only populated for a properly analyzed instruction - a bare
+    decode_insn() call does not create them.
+    """
+    try:
+        head = ida_bytes.get_item_head(ea)
+        flags = ida_bytes.get_full_flags(ea)
+        if head == ea and ida_bytes.is_code(flags) and ida_bytes.get_item_size(ea) == expected_size:
+            return True
+    except Exception:
+        pass
+    try:
+        ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, expected_size)
+        return ida_ua.create_insn(ea) > 0
+    except Exception:
+        return False
+
+
+def _resolve_indirect_jump_successors(ea):
+    """Best-effort enumeration of an indirect jump/call's targets via IDA's
+    switch/jump-table analysis. Returns a list of BlockSuccessor. If IDA
+    did not recognize a switch here, returns a single role="unresolved"
+    successor (ea=None) - the block itself is still real, only its final
+    jump's destination is ambiguous.
+    """
+    try:
+        si = ida_nalt.get_switch_info(ea)
+    except Exception:
+        si = None
+    if si is None:
+        return [BlockSuccessor(
+            ea=None, role="unresolved", case_values=None,
+            note="Indirect jump; IDA did not resolve a jump table here.",
+        )]
+    try:
+        results = ida_xref.calc_switch_cases(ea, si)
+    except Exception:
+        results = None
+    if results is None or not len(results.targets):
+        return [BlockSuccessor(
+            ea=None, role="unresolved", case_values=None,
+            note="Indirect jump; switch info present but no cases resolved.",
+        )]
+    successors = []
+    for idx in range(len(results.targets)):
+        target = results.targets[idx]
+        case_values = list(results.cases[idx]) if idx < len(results.cases) else []
+        successors.append(BlockSuccessor(
+            ea=target, role="case", case_values=case_values,
+            note="case %s" % ", ".join(str(v) for v in case_values) if case_values else None,
+        ))
+    return successors
+
+
+# ---------------------------------------------------------------------------
+# CFG trace: lightweight symbolic/constant-propagation engine
+#
+# Resolves the common "opaque predicate" and "flattening dispatcher" cases
+# WITHOUT an LLM round-trip (this is what makes tracing fast), and also
+# recognizes genuine data-dependent branches (an ordinary conditional on
+# caller-supplied input, not obfuscation) so those get marked real on
+# every side automatically too. Falls back to the LLM (CfgTraceRunner's
+# existing path, unchanged) whenever it cannot confidently resolve
+# something - this engine's failure mode is always "don't know", never a
+# silently wrong verdict. See the module-level docstring in the class
+# below for the full design reasoning.
+# ---------------------------------------------------------------------------
+
+class _ExternalTaint(object):
+    """Sentinel: this value is known to derive from genuine runtime/
+    caller-controlled data (e.g. a memory read from a writable segment,
+    or through a pointer whose own value is untracked) - NOT the same as
+    plain unknown (None), which means "hit something we don't model" and
+    must always fall back to the LLM. Conflating the two would risk
+    silently mismarking a real opaque predicate the engine just failed
+    to model as if it were an ordinary data-dependent branch.
+    """
+    def __repr__(self):
+        return "EXTERNAL"
+
+
+EXTERNAL = _ExternalTaint()
+
+_SYM_WIDTH_MASK = {1: 0xFF, 2: 0xFFFF, 4: 0xFFFFFFFF, 8: 0xFFFFFFFFFFFFFFFF}
+
+# kind: "reg" | "imm" | "mem_direct" | "mem_simple" | "unsupported"
+#   reg:         family=GPR family key (see _family_of), value=None, width=bytes
+#   imm:         family=None, value=int,                            width=bytes
+#   mem_direct:  family=None, value=absolute address,                width=bytes
+#   mem_simple:  family=base GPR family, value=raw displacement,     width=bytes
+#     (no index/scale field at all - indexed/SIB addressing is rejected
+#     at the adapter layer below, before it can ever reach this engine,
+#     since decoding it isn't safely reachable from documented op_t
+#     fields without the C++ SDK headers)
+#   unsupported: family=None, value=None, width=None
+SymOperand = namedtuple("SymOperand", ["kind", "family", "value", "width"])
+SymInsn = namedtuple("SymInsn", ["mnem", "operands"])
+_UNSUPPORTED_OPERAND = SymOperand(kind="unsupported", family=None, value=None, width=None)
+
+
+def _sym_to_signed(val, width):
+    bits = width * 8
+    if val >= (1 << (bits - 1)):
+        return val - (1 << bits)
+    return val
+
+
+class SymState(object):
+    """A snapshot of what the trace concretely knows about registers and
+    a bounded set of base+displacement memory slots at one point in the
+    walk. Every write to a register purges memory slots keyed by that
+    register as a base - this is what makes frame/stack-relative slot
+    tracking safe without ever computing an absolute stack address: two
+    operands with the same (base, disp) key are only trusted to be the
+    same slot as long as the base hasn't been reassigned in between.
+    """
+    __slots__ = ("regs", "mem", "last_cmp", "last_flags")
+
+    def __init__(self):
+        self.regs = {}          # family -> int | EXTERNAL
+        self.mem = {}           # (base_family, raw_disp) -> (int|EXTERNAL, width)
+        self.last_cmp = None    # (left, right, width) from cmp/sub - left/right may be EXTERNAL
+        self.last_flags = None  # (value, width) from test/and/or/xor/other arith result
+
+    def copy(self):
+        s = SymState()
+        s.regs = dict(self.regs)
+        s.mem = dict(self.mem)
+        s.last_cmp = self.last_cmp
+        s.last_flags = self.last_flags
+        return s
+
+    def reset(self):
+        self.regs = {}
+        self.mem = {}
+        self.last_cmp = None
+        self.last_flags = None
+
+    def write_reg(self, family, value):
+        if family is None:
+            return
+        self.mem = {k: v for k, v in self.mem.items() if k[0] != family}
+        if value is None:
+            self.regs.pop(family, None)
+        elif value is EXTERNAL:
+            self.regs[family] = EXTERNAL
+        else:
+            self.regs[family] = value & _SYM_WIDTH_MASK[8]
+
+    def read_reg(self, family, width):
+        if family is None:
+            return None
+        v = self.regs.get(family)
+        if v is None or v is EXTERNAL:
+            return v
+        return v & _SYM_WIDTH_MASK[width]
+
+
+def _sym_read_static_memory(addr, width):
+    """Reads a concrete value straight from the loaded binary image, but
+    ONLY when the containing segment is read-only - a mutable global's
+    static initializer is not a trustworthy stand-in for its value at an
+    arbitrary point during execution. A writable/unknown segment yields
+    EXTERNAL (genuinely runtime-determined), not a wrong guess.
+    """
+    try:
+        seg = ida_segment.getseg(addr)
+    except Exception:
+        seg = None
+    if seg is None or not seg.perm:
+        return None
+    writable = bool(seg.perm & ida_segment.SEGPERM_WRITE)
+    try:
+        if width == 1:
+            value = ida_bytes.get_byte(addr)
+        elif width == 2:
+            value = ida_bytes.get_word(addr)
+        elif width == 4:
+            value = ida_bytes.get_wide_dword(addr)
+        elif width == 8:
+            value = ida_bytes.get_qword(addr)
+        else:
+            return None
+    except Exception:
+        return None
+    return EXTERNAL if writable else value
+
+
+def _sym_resolve_operand(state, op):
+    if op.kind == "imm":
+        return op.value & _SYM_WIDTH_MASK[op.width]
+    if op.kind == "reg":
+        return state.read_reg(op.family, op.width)
+    if op.kind == "mem_direct":
+        return _sym_read_static_memory(op.value, op.width)
+    if op.kind == "mem_simple":
+        slot = state.mem.get((op.family, op.value))
+        if slot is not None and slot[1] == op.width:
+            return slot[0]
+        base_val = state.regs.get(op.family)
+        if base_val is None:
+            return None
+        if base_val is EXTERNAL:
+            return EXTERNAL
+        addr = (base_val + op.value) & _SYM_WIDTH_MASK[8]
+        return _sym_read_static_memory(addr, op.width)
+    return None
+
+
+def _sym_combine(a, b):
+    if a is None or b is None:
+        return "unsupported"
+    if a is EXTERNAL or b is EXTERNAL:
+        return "external"
+    return "concrete"
+
+
+def _sym_write_dest(state, dst_op, value):
+    if dst_op.kind == "mem_simple":
+        key = (dst_op.family, dst_op.value)
+        if value is None:
+            state.mem.pop(key, None)
+        else:
+            state.mem[key] = (value, dst_op.width)
+        return
+    if dst_op.kind != "reg":
+        return  # mem_direct / unsupported destinations are not tracked
+    if dst_op.width not in (4, 8):
+        # 8/16-bit partial-register writes don't clear the rest of the
+        # register on real hardware and we don't model that precisely -
+        # conservatively taint the whole family rather than guess.
+        state.write_reg(dst_op.family, None)
+        return
+    if value is None:
+        state.write_reg(dst_op.family, None)
+    elif value is EXTERNAL:
+        state.write_reg(dst_op.family, EXTERNAL)
+    else:
+        # x86-64 rule: a 32-bit write zero-extends into the full 64-bit
+        # register; a 64-bit write is already the whole register.
+        state.write_reg(dst_op.family, value & _SYM_WIDTH_MASK[dst_op.width])
+
+
+def _sym_h_mov(state, ops):
+    dst, src = ops[0], ops[1]
+    _sym_write_dest(state, dst, _sym_resolve_operand(state, src))
+
+
+def _sym_h_movzx(state, ops):
+    dst, src = ops[0], ops[1]
+    _sym_write_dest(state, dst, _sym_resolve_operand(state, src))
+
+
+def _sym_h_movsx(state, ops):
+    dst, src = ops[0], ops[1]
+    val = _sym_resolve_operand(state, src)
+    if isinstance(val, int):
+        val = _sym_to_signed(val, src.width) & _SYM_WIDTH_MASK[8]
+    _sym_write_dest(state, dst, val)
+
+
+def _sym_h_lea(state, ops):
+    dst, src = ops[0], ops[1]
+    if src.kind == "mem_direct":
+        _sym_write_dest(state, dst, src.value & _SYM_WIDTH_MASK[dst.width])
+        return
+    if src.kind == "mem_simple":
+        base_val = state.regs.get(src.family)
+        if base_val is None:
+            _sym_write_dest(state, dst, None)
+        elif base_val is EXTERNAL:
+            _sym_write_dest(state, dst, EXTERNAL)
+        else:
+            addr = (base_val + src.value) & _SYM_WIDTH_MASK[8]
+            _sym_write_dest(state, dst, addr & _SYM_WIDTH_MASK[dst.width])
+        return
+    _sym_write_dest(state, dst, None)
+
+
+def _sym_make_alu2(op_name):
+    def handler(state, ops):
+        dst, src = ops[0], ops[1]
+        left = _sym_resolve_operand(state, dst)
+        right = _sym_resolve_operand(state, src)
+        combo = _sym_combine(left, right)
+        if combo == "unsupported":
+            _sym_write_dest(state, dst, None)
+            state.last_flags = None
+            if op_name == "sub":
+                state.last_cmp = None
+            return
+        if combo == "external":
+            _sym_write_dest(state, dst, EXTERNAL)
+            state.last_flags = (EXTERNAL, dst.width)
+            if op_name == "sub":
+                state.last_cmp = (left, right, dst.width)
+            return
+        width = dst.width
+        if op_name == "add":
+            result = (left + right) & _SYM_WIDTH_MASK[width]
+        elif op_name == "sub":
+            result = (left - right) & _SYM_WIDTH_MASK[width]
+            state.last_cmp = (left, right, width)
+        elif op_name == "and":
+            result = left & right
+        elif op_name == "or":
+            result = left | right
+        elif op_name == "xor":
+            result = left ^ right
+        else:
+            raise AssertionError(op_name)
+        _sym_write_dest(state, dst, result)
+        state.last_flags = (result, width)
+    return handler
+
+
+def _sym_h_cmp(state, ops):
+    dst, src = ops[0], ops[1]
+    left = _sym_resolve_operand(state, dst)
+    right = _sym_resolve_operand(state, src)
+    combo = _sym_combine(left, right)
+    state.last_cmp = None if combo == "unsupported" else (left, right, dst.width)
+
+
+def _sym_h_test(state, ops):
+    dst, src = ops[0], ops[1]
+    left = _sym_resolve_operand(state, dst)
+    right = _sym_resolve_operand(state, src)
+    combo = _sym_combine(left, right)
+    if combo == "unsupported":
+        state.last_flags = None
+    elif combo == "external":
+        state.last_flags = (EXTERNAL, dst.width)
+    else:
+        state.last_flags = (left & right, dst.width)
+
+
+def _sym_make_unary(op_name):
+    def handler(state, ops):
+        dst = ops[0]
+        val = _sym_resolve_operand(state, dst)
+        if val is None:
+            _sym_write_dest(state, dst, None)
+            if op_name != "not":
+                state.last_flags = None
+            return
+        if val is EXTERNAL:
+            _sym_write_dest(state, dst, EXTERNAL)
+            if op_name != "not":
+                state.last_flags = (EXTERNAL, dst.width)
+            return
+        width = dst.width
+        if op_name == "not":
+            _sym_write_dest(state, dst, (~val) & _SYM_WIDTH_MASK[width])
+            return  # NOT does not affect flags on real x86
+        if op_name == "neg":
+            result = (-val) & _SYM_WIDTH_MASK[width]
+        elif op_name == "inc":
+            result = (val + 1) & _SYM_WIDTH_MASK[width]
+        elif op_name == "dec":
+            result = (val - 1) & _SYM_WIDTH_MASK[width]
+        else:
+            raise AssertionError(op_name)
+        _sym_write_dest(state, dst, result)
+        state.last_flags = (result, width)
+    return handler
+
+
+def _sym_make_shift(op_name):
+    def handler(state, ops):
+        dst, src = ops[0], ops[1]
+        val = _sym_resolve_operand(state, dst)
+        if src.kind != "imm" or val is None:
+            _sym_write_dest(state, dst, None)
+            state.last_flags = None
+            return
+        if val is EXTERNAL:
+            _sym_write_dest(state, dst, EXTERNAL)
+            state.last_flags = (EXTERNAL, dst.width)
+            return
+        width = dst.width
+        count = src.value & 0x3F
+        if op_name == "shl":
+            result = (val << count) & _SYM_WIDTH_MASK[width]
+        elif op_name == "shr":
+            result = (val & _SYM_WIDTH_MASK[width]) >> count
+        elif op_name == "sar":
+            result = (_sym_to_signed(val, width) >> count) & _SYM_WIDTH_MASK[width]
+        else:
+            raise AssertionError(op_name)
+        _sym_write_dest(state, dst, result)
+        state.last_flags = (result, width)
+    return handler
+
+
+def _sym_h_push(state, ops, rsp_family):
+    state.write_reg(rsp_family, None)
+
+
+def _sym_h_pop(state, ops, rsp_family):
+    dst = ops[0]
+    if dst.kind == "reg":
+        state.write_reg(dst.family, None)
+    state.write_reg(rsp_family, None)
+
+
+_SYM_INSN_HANDLERS = {
+    "nop": lambda state, ops: None,
+    "mov": _sym_h_mov,
+    "movzx": _sym_h_movzx,
+    "movsx": _sym_h_movsx,
+    "movsxd": _sym_h_movsx,
+    "lea": _sym_h_lea,
+    "add": _sym_make_alu2("add"),
+    "sub": _sym_make_alu2("sub"),
+    "and": _sym_make_alu2("and"),
+    "or": _sym_make_alu2("or"),
+    "xor": _sym_make_alu2("xor"),
+    "cmp": _sym_h_cmp,
+    "test": _sym_h_test,
+    "not": _sym_make_unary("not"),
+    "neg": _sym_make_unary("neg"),
+    "inc": _sym_make_unary("inc"),
+    "dec": _sym_make_unary("dec"),
+    "shl": _sym_make_shift("shl"),
+    "sal": _sym_make_shift("shl"),
+    "shr": _sym_make_shift("shr"),
+    "sar": _sym_make_shift("sar"),
+    # push/pop take rsp_family as an extra argument - dispatched specially
+    # in sym_run_block below rather than through this plain handler dict.
+}
+
+
+def sym_run_block(state, sym_insns, rsp_family):
+    """Executes a linear sequence of SymInsn against a COPY of state,
+    returning the resulting state.
+
+    "call" is special-cased: registers are reset to EXTERNAL (not fully
+    unsupported/None) and memory slots are cleared, since a real
+    function's return value/output-parameters are, in the overwhelming
+    majority of real code, genuine runtime computation - the same
+    "we don't control this, but it's not a modeling failure" case
+    EXTERNAL already represents for argument-derived data. This lets an
+    ordinary "if (helper_call(...)) ..." resolve as a data-dependent
+    branch (both sides real) without an LLM round-trip. (The counter-risk
+    - an obfuscator hiding a genuinely fixed opaque-predicate constant
+    behind a call specifically to defeat this - is judged rare enough to
+    accept, especially since nothing is ever written to the database
+    without the user reviewing the result afterward.)
+
+    Any OTHER unmodeled instruction (an unusual bit-trick/SIMD op inline
+    in the block, for example) resets to fully unsupported/None instead -
+    deliberately kept strict, since an obfuscator choosing an exotic
+    inline instruction specifically to compute a real dispatcher constant
+    is a much more plausible adversarial pattern than hiding one behind
+    an entire function call.
+    """
+    state = state.copy()
+    for insn in sym_insns:
+        mnem = insn.mnem
+        try:
+            if mnem == "push":
+                _sym_h_push(state, insn.operands, rsp_family)
+                continue
+            if mnem == "pop":
+                _sym_h_pop(state, insn.operands, rsp_family)
+                continue
+            if mnem == "call":
+                state.mem = {}
+                state.regs = dict(_sym_all_external_regs())
+                state.last_cmp = None
+                state.last_flags = None
+                continue
+            handler = _SYM_INSN_HANDLERS.get(mnem)
+            if handler is None:
+                state.reset()
+                continue
+            handler(state, insn.operands)
+        except Exception:
+            state.reset()
+    return state
+
+
+# -- condition evaluation ---------------------------------------------------
+# Each evaluator returns ("taken", True/False) | ("data_dependent", None)
+# | ("unknown", None) - "data_dependent" means the comparison genuinely
+# involves EXTERNAL (runtime/caller-controlled) data, so this is ordinary
+# conditional logic from the original program, not an opaque predicate -
+# every candidate should be marked REAL, not resolved one way or picked
+# arbitrarily.
+
+def _sym_cmp_based(fn):
+    def evaluator(state):
+        if state.last_cmp is None:
+            return "unknown", None
+        left, right, width = state.last_cmp
+        if left is EXTERNAL or right is EXTERNAL:
+            return "data_dependent", None
+        return "taken", fn(left, right, width)
+    return evaluator
+
+
+def _sym_zero_based(fn):
+    def evaluator(state):
+        if state.last_cmp is not None:
+            left, right, width = state.last_cmp
+            if left is EXTERNAL or right is EXTERNAL:
+                return "data_dependent", None
+            value = (left - right) & _SYM_WIDTH_MASK[width]
+            return "taken", fn(value, width)
+        if state.last_flags is not None:
+            value, width = state.last_flags
+            if value is EXTERNAL:
+                return "data_dependent", None
+            return "taken", fn(value, width)
+        return "unknown", None
+    return evaluator
+
+
+_SYM_CONDITION_EVALUATORS = {
+    "jz": _sym_zero_based(lambda v, w: v == 0),
+    "je": _sym_zero_based(lambda v, w: v == 0),
+    "jnz": _sym_zero_based(lambda v, w: v != 0),
+    "jne": _sym_zero_based(lambda v, w: v != 0),
+    "js": _sym_zero_based(lambda v, w: _sym_to_signed(v, w) < 0),
+    "jns": _sym_zero_based(lambda v, w: _sym_to_signed(v, w) >= 0),
+
+    "ja": _sym_cmp_based(lambda l, r, w: l > r),
+    "jnbe": _sym_cmp_based(lambda l, r, w: l > r),
+    "jae": _sym_cmp_based(lambda l, r, w: l >= r),
+    "jnb": _sym_cmp_based(lambda l, r, w: l >= r),
+    "jnc": _sym_cmp_based(lambda l, r, w: l >= r),
+    "jb": _sym_cmp_based(lambda l, r, w: l < r),
+    "jc": _sym_cmp_based(lambda l, r, w: l < r),
+    "jnae": _sym_cmp_based(lambda l, r, w: l < r),
+    "jbe": _sym_cmp_based(lambda l, r, w: l <= r),
+    "jna": _sym_cmp_based(lambda l, r, w: l <= r),
+
+    "jg": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) > _sym_to_signed(r, w)),
+    "jnle": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) > _sym_to_signed(r, w)),
+    "jge": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) >= _sym_to_signed(r, w)),
+    "jnl": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) >= _sym_to_signed(r, w)),
+    "jl": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) < _sym_to_signed(r, w)),
+    "jnge": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) < _sym_to_signed(r, w)),
+    "jle": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) <= _sym_to_signed(r, w)),
+    "jng": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) <= _sym_to_signed(r, w)),
+}
+
+
+def sym_evaluate_branch_condition(state, mnem, rcx_family):
+    mnem = mnem.lower()
+    if mnem in ("jcxz", "jecxz", "jrcxz"):
+        width = {"jcxz": 2, "jecxz": 4, "jrcxz": 8}[mnem]
+        val = state.read_reg(rcx_family, width)
+        if val is None:
+            return "unknown", None
+        if val is EXTERNAL:
+            return "data_dependent", None
+        return "taken", (val == 0)
+    evaluator = _SYM_CONDITION_EVALUATORS.get(mnem)
+    if evaluator is None:
+        return "unknown", None
+    return evaluator(state)
+
+
+def sym_resolve_conditional_branch(state, mnem, successors, rcx_family):
+    """successors: exactly [jump_target, fallthrough] (gather_block's
+    fixed ordering for a 2-way conditional branch). Returns:
+      ("opaque", {ea: True/False})       - definitive REAL/DEAD verdicts
+      ("data_dependent", {ea: True, ...}) - every successor is REAL
+      ("unknown", None)                   - caller must fall back to the LLM
+    """
+    if len(successors) != 2:
+        return "unknown", None
+    kind, taken = sym_evaluate_branch_condition(state, mnem, rcx_family)
+    if kind == "unknown":
+        return "unknown", None
+    if kind == "data_dependent":
+        return "data_dependent", {s.ea: True for s in successors}
+    jump_target, fallthrough = successors[0], successors[1]
+    if taken:
+        return "opaque", {jump_target.ea: True, fallthrough.ea: False}
+    return "opaque", {jump_target.ea: False, fallthrough.ea: True}
+
+
+def sym_resolve_indirect_jump(state, target_operand, successors):
+    if len(successors) == 1 and successors[0].ea is None:
+        return "unknown", None
+    resolved = _sym_resolve_operand(state, target_operand)
+    if resolved is None:
+        return "unknown", None
+    if resolved is EXTERNAL:
+        return "data_dependent", {s.ea: True for s in successors}
+    matches = [s for s in successors if s.ea == resolved]
+    if len(matches) == 1:
+        return "opaque", {s.ea: (s.ea == resolved) for s in successors}
+    return "unknown", None
+
+
+# -- ida_ua.insn_t / op_t adapter -------------------------------------------
+# The only part of this engine that touches IDA APIs - translates real
+# decoded instructions into the plain SymOperand/SymInsn descriptors above.
+
+_GPR_64BIT_NAMES = (
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+)
+_gpr_family_cache = {}
+_gpr_family_set_cache = None
+
+
+def _family_of(name):
+    """Register-family index for a canonical 64-bit GPR name, resolved
+    via ida_idp.str2reg (the documented name->index lookup) rather than
+    assumed from a hardcoded numbering scheme - lazily cached, since
+    str2reg needs a processor/database already loaded and this file's
+    module-level code may run before one exists.
+    """
+    if name not in _gpr_family_cache:
+        try:
+            idx = ida_idp.str2reg(name)
+        except Exception:
+            idx = -1
+        _gpr_family_cache[name] = idx if idx is not None and idx >= 0 else None
+    return _gpr_family_cache[name]
+
+
+def _gpr_family_set():
+    global _gpr_family_set_cache
+    if _gpr_family_set_cache is None:
+        _gpr_family_set_cache = {f for f in (_family_of(n) for n in _GPR_64BIT_NAMES) if f is not None}
+    return _gpr_family_set_cache
+
+
+_all_external_regs_cache = None
+
+
+def _sym_all_external_regs():
+    global _all_external_regs_cache
+    if _all_external_regs_cache is None:
+        _all_external_regs_cache = {f: EXTERNAL for f in _gpr_family_set()}
+    return _all_external_regs_cache
+
+
+def sym_initial_state():
+    """A SymState for the very start of a trace: every GPR is seeded
+    EXTERNAL rather than left absent/unsupported, since at function
+    entry every register genuinely holds SOME value the caller put
+    there - reading through an untouched register (e.g. an incoming
+    argument in rcx) is exactly the "genuine runtime/caller-controlled
+    data" case EXTERNAL exists for, not a modeling gap. Without this,
+    the extremely common "if (arg->field == N)"-shaped code never
+    resolves automatically even though it isn't obfuscation at all.
+    """
+    state = SymState()
+    state.regs = dict(_sym_all_external_regs())
+    return state
+
+
+_SYM_DTYPE_WIDTH = None
+
+
+def _dtype_width(dtype):
+    global _SYM_DTYPE_WIDTH
+    if _SYM_DTYPE_WIDTH is None:
+        _SYM_DTYPE_WIDTH = {
+            ida_ua.dt_byte: 1, ida_ua.dt_word: 2, ida_ua.dt_dword: 4, ida_ua.dt_qword: 8,
+        }
+    return _SYM_DTYPE_WIDTH.get(dtype)
+
+
+_NUMERIC_TERM_RE = re.compile(r"^[+-]?(?:0[xX][0-9a-fA-F]+|[0-9A-Fa-f]+[hH]?|\d+)$")
+_PTR_PREFIX_RE = re.compile(r"^(?:byte|word|dword|qword|xmmword|ymmword|zmmword)\s+ptr\s+(.*)$", re.IGNORECASE)
+
+
+def _operand_looks_indexed(ea, opnum):
+    """True if this memory operand's rendered text suggests more than a
+    simple base+displacement (a second register term, or an explicit
+    scale factor). SIB (base+index*scale) decoding isn't safely reachable
+    from documented op_t fields without the C++ SDK headers (not shipped
+    with this install), so any operand that MIGHT be indexed is rejected
+    here rather than guessed at - the engine never sees it, so it always
+    falls back to the LLM for these rather than risking a wrong read.
+    """
+    try:
+        text = idc.print_operand(ea, opnum) or ""
+    except Exception:
+        return True
+    text = text.strip()
+    m = _PTR_PREFIX_RE.match(text)
+    if m:
+        text = m.group(1).strip()
+    if not (text.startswith("[") and text.endswith("]")):
+        return True
+    inner = text[1:-1]
+    if "*" in inner:
+        return True
+    terms = re.findall(r"[+-]?[^+-]+", inner)
+    reg_like = [t for t in terms if not _NUMERIC_TERM_RE.match(t.strip())]
+    return len(reg_like) > 1
+
+
+def _extract_sym_operand(ea, opnum, op):
+    width = _dtype_width(op.dtype)
+    if op.type == ida_ua.o_imm:
+        if width is None:
+            return _UNSUPPORTED_OPERAND
+        return SymOperand(kind="imm", family=None, value=op.value, width=width)
+    if op.type == ida_ua.o_reg:
+        if width is None or op.reg not in _gpr_family_set():
+            return _UNSUPPORTED_OPERAND
+        return SymOperand(kind="reg", family=op.reg, value=None, width=width)
+    if op.type == ida_ua.o_mem:
+        if width is None:
+            return _UNSUPPORTED_OPERAND
+        return SymOperand(kind="mem_direct", family=None, value=op.addr, width=width)
+    if op.type in (ida_ua.o_displ, ida_ua.o_phrase):
+        if width is None or op.reg not in _gpr_family_set():
+            return _UNSUPPORTED_OPERAND
+        if _operand_looks_indexed(ea, opnum):
+            return _UNSUPPORTED_OPERAND
+        disp = op.addr if op.type == ida_ua.o_displ else 0
+        return SymOperand(kind="mem_simple", family=op.reg, value=disp, width=width)
+    return _UNSUPPORTED_OPERAND
+
+
+def _extract_sym_insn(ea, insn):
+    mnem = (insn.get_canon_mnem() or "").lower()
+    operands = []
+    for i in range(8):
+        op = insn.ops[i]
+        if op.type == ida_ua.o_void:
+            break
+        operands.append(_extract_sym_operand(ea, i, op))
+    return SymInsn(mnem=mnem, operands=tuple(operands))
+
+
+def gather_block(start_ea, max_instrs=_MAX_BLOCK_INSTRS):
+    """Walks linearly forward from start_ea, one basic block's worth of
+    instructions, classifying how it ends and enumerating its successors.
+    Does not recurse into successors - callers drive the worklist.
+
+    Fixes up each instruction's item boundary (undefine + recreate, never
+    touching bytes) as it walks, before relying on it for anything -
+    obfuscated code frequently has real code starting mid-way through
+    what IDA's original analysis mis-disassembled as one bigger
+    instruction, and both the displayed text and CodeRefsFrom's branch-
+    target resolution below are only correct once that's fixed. This is
+    the one place this feature writes to the database outside of the
+    user's explicit Accept step; see CfgTraceRunner for how these calls
+    are kept off LlamaStreamWorker's MFF_FAST callback thread context.
+    """
+    lines = []
+    insn_eas = []
+    sym_insns = []
+    ea = start_ea
+    for _ in range(max_instrs):
+        insn = ida_ua.insn_t()
+        size = ida_ua.decode_insn(insn, ea)
+        if size <= 0:
+            try:
+                line = idc.generate_disasm_line(ea, idc.GENDSM_REMOVE_TAGS)
+            except Exception:
+                line = idc.GetDisasm(ea)
+            lines.append("%#010x  %s" % (ea, ida_lines.tag_remove(line) if line else "(undecodable)"))
+            return BlockInfo(
+                start_ea=start_ea, end_ea=ea, text="\n".join(lines), kind="undecodable",
+                successors=[], last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
+            )
+        _fixup_instruction_boundary(ea, size)
+        insn_eas.append(ea)
+        try:
+            line = idc.generate_disasm_line(ea, idc.GENDSM_REMOVE_TAGS)
+        except Exception:
+            line = idc.GetDisasm(ea)
+        lines.append("%#010x  %s" % (ea, ida_lines.tag_remove(line) if line else ""))
+
+        feature = insn.get_canon_feature()
+        is_call = bool(feature & ida_idp.CF_CALL)
+        is_stop = bool(feature & ida_idp.CF_STOP)
+        is_indirect = bool(feature & ida_idp.CF_JUMP)
+        next_ea = ea + size
+
+        if is_call:
+            # Assume the call returns (v1 does not reason about
+            # non-returning calls) - the block simply continues past it.
+            # The symbolic engine treats "call" as an unmodeled mnemonic
+            # (full state reset), same conservative v1 simplification.
+            sym_insns.append(SymInsn(mnem="call", operands=()))
+            ea = next_ea
+            continue
+
+        sym_insns.append(_extract_sym_insn(ea, insn))
+
+        if not is_stop and not is_indirect:
+            # Plain non-control-transfer instruction, or a conditional
+            # branch feature check below handles that case separately.
+            explicit_targets = []
+            try:
+                explicit_targets = list(idautils.CodeRefsFrom(ea, 0))
+            except Exception:
+                pass
+            if not explicit_targets:
+                ea = next_ea
+                continue
+            # A control-transfer that CF_STOP/CF_JUMP didn't flag as such
+            # (e.g. some conditional-branch encodings) but that does have
+            # explicit code targets - treat it as ending the block.
+            successors = [
+                BlockSuccessor(ea=t, role="jump_target", case_values=None, note=None)
+                for t in explicit_targets
+            ]
+            successors.append(BlockSuccessor(ea=next_ea, role="fallthrough", case_values=None, note=None))
+            kind = "conditional_branch" if len(successors) > 1 else "unconditional_jump"
+            return BlockInfo(
+                start_ea=start_ea, end_ea=next_ea, text="\n".join(lines), kind=kind,
+                successors=successors, last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
+            )
+
+        if is_indirect:
+            successors = _resolve_indirect_jump_successors(ea)
+            return BlockInfo(
+                start_ea=start_ea, end_ea=next_ea, text="\n".join(lines), kind="indirect_jump",
+                successors=successors, last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
+            )
+
+        # CF_STOP: doesn't pass execution to the next instruction.
+        explicit_targets = []
+        try:
+            explicit_targets = list(idautils.CodeRefsFrom(ea, 0))
+        except Exception:
+            pass
+        if not explicit_targets:
+            return BlockInfo(
+                start_ea=start_ea, end_ea=next_ea, text="\n".join(lines), kind="return",
+                successors=[], last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
+            )
+        if len(explicit_targets) == 1:
+            successors = [BlockSuccessor(ea=explicit_targets[0], role="jump_target", case_values=None, note=None)]
+            return BlockInfo(
+                start_ea=start_ea, end_ea=next_ea, text="\n".join(lines), kind="unconditional_jump",
+                successors=successors, last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
+            )
+        successors = [
+            BlockSuccessor(ea=t, role="jump_target", case_values=None, note=None) for t in explicit_targets
+        ]
+        return BlockInfo(
+            start_ea=start_ea, end_ea=next_ea, text="\n".join(lines), kind="conditional_branch",
+            successors=successors, last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
+        )
+
+    return BlockInfo(
+        start_ea=start_ea, end_ea=ea, text="\n".join(lines), kind="truncated",
+        successors=[], last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -849,6 +1893,17 @@ class PluginConfig(object):
         self.system_prompt = self.system_prompt or DEFAULT_SYSTEM_PROMPT
         self.explain_hotkey = (self.explain_hotkey or "").strip()
         self.include_callees = bool(self.include_callees)
+        try:
+            self.max_trace_blocks = max(1, min(5000, int(self.max_trace_blocks)))
+        except (TypeError, ValueError):
+            self.max_trace_blocks = DEFAULT_CONFIG["max_trace_blocks"]
+        for _color_key in ("cfg_trace_color_real", "cfg_trace_color_dead", "cfg_trace_color_unresolved"):
+            try:
+                setattr(self, _color_key, max(0, min(0xFFFFFF, int(getattr(self, _color_key)))))
+            except (TypeError, ValueError):
+                setattr(self, _color_key, DEFAULT_CONFIG[_color_key])
+        self.cfg_trace_system_prompt = self.cfg_trace_system_prompt or CFG_TRACE_SYSTEM_PROMPT
+        self.cfg_trace_use_symbolic = bool(self.cfg_trace_use_symbolic)
 
 
 # ---------------------------------------------------------------------------
@@ -1662,6 +2717,29 @@ class ExplainResultDialog(QtWidgets.QDialog):
         super().closeEvent(event)
 
 
+def _rgb_hex_to_bgr_int(text, fallback):
+    """Settings shows CFG-trace colors as plain '#RRGGBB' hex strings (the
+    reading order everyone expects); idc.set_color's native representation
+    is a 0xBBGGRR-packed int (BGR, not RGB) - convert on the way in/out so
+    that trap stays contained to these two helpers.
+    """
+    text = (text or "").strip().lstrip("#")
+    try:
+        value = int(text, 16)
+    except ValueError:
+        return fallback
+    if not (0 <= value <= 0xFFFFFF):
+        return fallback
+    r, g, b = (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF
+    return (b << 16) | (g << 8) | r
+
+
+def _bgr_int_to_rgb_hex(value):
+    value = max(0, min(0xFFFFFF, int(value)))
+    b, g, r = (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF
+    return "#%02X%02X%02X" % (r, g, b)
+
+
 # ---------------------------------------------------------------------------
 # UI: settings dialog
 # ---------------------------------------------------------------------------
@@ -1796,6 +2874,54 @@ class SettingsDialog(QtWidgets.QDialog):
         self.system_prompt_edit.setMinimumHeight(140)
         form.addRow("System prompt:", self.system_prompt_edit)
 
+        self.max_trace_blocks_spin = QtWidgets.QSpinBox()
+        self.max_trace_blocks_spin.setRange(1, 5000)
+        self.max_trace_blocks_spin.setToolTip(
+            "Safety cap on how many basic blocks 'Trace/Recover CFG' will "
+            "decode in one run (every block counts, including auto-resolved "
+            "ones). Hitting it stops with a partial result rather than "
+            "running unbounded."
+        )
+        form.addRow("Max CFG trace blocks:", self.max_trace_blocks_spin)
+
+        self.cfg_trace_use_symbolic_check = QtWidgets.QCheckBox(
+            "Resolve CFG trace branches via constant propagation before asking the LLM"
+        )
+        self.cfg_trace_use_symbolic_check.setToolTip(
+            "Tries a lightweight, deterministic symbolic-execution pass first "
+            "(register/stack-slot constant tracking, x86/x64 only) at each "
+            "branch or indirect jump - resolves classic opaque predicates "
+            "and flattening dispatchers, and recognizes genuine "
+            "data-dependent branches (marking every side real), without an "
+            "LLM round-trip. Falls back to the LLM whenever it cannot "
+            "confidently resolve something; never guesses. Disable to force "
+            "every decision point through the LLM as before."
+        )
+        form.addRow(self.cfg_trace_use_symbolic_check)
+
+        color_row = QtWidgets.QHBoxLayout()
+        self.cfg_trace_color_real_edit = QtWidgets.QLineEdit()
+        self.cfg_trace_color_real_edit.setPlaceholderText("#RRGGBB")
+        self.cfg_trace_color_real_edit.setMaximumWidth(90)
+        color_row.addWidget(QtWidgets.QLabel("Real:"))
+        color_row.addWidget(self.cfg_trace_color_real_edit)
+        self.cfg_trace_color_dead_edit = QtWidgets.QLineEdit()
+        self.cfg_trace_color_dead_edit.setPlaceholderText("#RRGGBB")
+        self.cfg_trace_color_dead_edit.setMaximumWidth(90)
+        color_row.addWidget(QtWidgets.QLabel("Dead:"))
+        color_row.addWidget(self.cfg_trace_color_dead_edit)
+        self.cfg_trace_color_unresolved_edit = QtWidgets.QLineEdit()
+        self.cfg_trace_color_unresolved_edit.setPlaceholderText("#RRGGBB")
+        self.cfg_trace_color_unresolved_edit.setMaximumWidth(90)
+        color_row.addWidget(QtWidgets.QLabel("Unresolved:"))
+        color_row.addWidget(self.cfg_trace_color_unresolved_edit)
+        color_row.addStretch(1)
+        form.addRow("CFG trace colors:", color_row)
+
+        self.cfg_trace_system_prompt_edit = QtWidgets.QPlainTextEdit()
+        self.cfg_trace_system_prompt_edit.setMinimumHeight(140)
+        form.addRow("CFG trace system prompt:", self.cfg_trace_system_prompt_edit)
+
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel
@@ -1837,6 +2963,12 @@ class SettingsDialog(QtWidgets.QDialog):
         self.max_recursive_callees_spin.setValue(config.max_recursive_callees)
         self.hotkey_edit.setText(config.explain_hotkey)
         self.system_prompt_edit.setPlainText(config.system_prompt)
+        self.max_trace_blocks_spin.setValue(config.max_trace_blocks)
+        self.cfg_trace_use_symbolic_check.setChecked(config.cfg_trace_use_symbolic)
+        self.cfg_trace_color_real_edit.setText(_bgr_int_to_rgb_hex(config.cfg_trace_color_real))
+        self.cfg_trace_color_dead_edit.setText(_bgr_int_to_rgb_hex(config.cfg_trace_color_dead))
+        self.cfg_trace_color_unresolved_edit.setText(_bgr_int_to_rgb_hex(config.cfg_trace_color_unresolved))
+        self.cfg_trace_system_prompt_edit.setPlainText(config.cfg_trace_system_prompt)
 
     def _on_restore_defaults(self):
         answer = QtWidgets.QMessageBox.question(
@@ -1883,6 +3015,18 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.max_recursive_callees = self.max_recursive_callees_spin.value()
         cfg.explain_hotkey = self.hotkey_edit.text().strip()
         cfg.system_prompt = self.system_prompt_edit.toPlainText()
+        cfg.max_trace_blocks = self.max_trace_blocks_spin.value()
+        cfg.cfg_trace_use_symbolic = self.cfg_trace_use_symbolic_check.isChecked()
+        cfg.cfg_trace_color_real = _rgb_hex_to_bgr_int(
+            self.cfg_trace_color_real_edit.text(), cfg.cfg_trace_color_real
+        )
+        cfg.cfg_trace_color_dead = _rgb_hex_to_bgr_int(
+            self.cfg_trace_color_dead_edit.text(), cfg.cfg_trace_color_dead
+        )
+        cfg.cfg_trace_color_unresolved = _rgb_hex_to_bgr_int(
+            self.cfg_trace_color_unresolved_edit.text(), cfg.cfg_trace_color_unresolved
+        )
+        cfg.cfg_trace_system_prompt = self.cfg_trace_system_prompt_edit.toPlainText()
         cfg._validate()
         self.result_config = cfg
         self.accept()
@@ -2266,6 +3410,835 @@ class BatchProgressDialog(QtWidgets.QDialog):
 
 
 # ---------------------------------------------------------------------------
+# CFG trace: LLM-guided worklist driver (no Qt/DB writes - mark/comment
+# only happens later, in the review-step apply function)
+# ---------------------------------------------------------------------------
+
+def _parse_trace_address(token):
+    """Parses a REAL_TARGET/DEAD_TARGET/UNRESOLVED_TARGET address token.
+    Returns an int address, or None for a non-address token (e.g.
+    "indirect") or anything that doesn't parse.
+    """
+    token = (token or "").strip().strip("`'\"")
+    if not token or token.lower() in ("indirect", "unknown", "n/a", "none"):
+        return None
+    for base in (0, 16):
+        try:
+            return int(token, base)
+        except ValueError:
+            continue
+    return None
+
+
+# verdict: "real" | "dead" | "unresolved". insn_eas is the exact set of
+# instruction addresses this record covers, used for per-instruction
+# coloring/commenting on apply - no second decode pass needed.
+CfgTraceBlockRecord = namedtuple("CfgTraceBlockRecord", ["start_ea", "end_ea", "insn_eas", "verdict", "reason"])
+
+CfgTraceResult = namedtuple(
+    "CfgTraceResult", ["blocks", "partial", "blocks_processed", "unexplored", "error", "symbolic_resolved_count"]
+)
+
+
+class CfgTraceRunner(object):
+    """UI-free driver of one LLM-guided CFG-recovery trace, starting from a
+    single address. Walks basic blocks via gather_block(), auto-continuing
+    through anything with exactly one successor, and only round-trips to
+    the LLM at genuine decision points (conditional branches / indirect
+    jumps) - so LLM call count is proportional to real obfuscation
+    complexity, not total block count. Reuses ConversationRunner's
+    priority-order server-failover pattern. Nothing is written to the
+    database here; callers get a CfgTraceResult to review before applying.
+    """
+
+    def __init__(self, config, start_ea, on_log=None, on_status=None):
+        self.config = config
+        self.start_ea = start_ea
+        self._on_log = on_log or (lambda text: None)
+        self._on_status = on_status or (lambda text: None)
+        self._server_candidates = list(config.server_urls) or list(DEFAULT_CONFIG["server_urls"])
+        self.server_url = self._server_candidates[0]
+        self._failed_servers = set()
+
+        self.worklist = deque([start_ea])
+        self.queued = {start_ea}
+        self.visited = {}          # ea -> BlockInfo, confidently decoded + reached via a REAL predecessor
+        self.dead = set()          # eas confirmed dead
+        self.dead_blocks = {}      # ea -> BlockInfo, marking-only extent for coloring
+        self.dead_reason = {}      # ea -> reason text
+        self.decision_summary = {} # ea -> one-line "why this was enqueued" text (keyed like predecessors)
+        self.predecessors = {}     # ea -> predecessor ea, for breadcrumb reconstruction
+        self.unresolved = []       # list of dicts, see _flag_unresolved/_apply_decision
+        self._unresolved_eas = set()
+        self.trace_log = []
+        self.blocks_processed = 0
+        self.symbolic_resolved_count = 0  # blocks resolved without an LLM call, for the summary banner
+
+        # ea -> SymState as of the end of that block's predecessor (i.e.
+        # the state to run THIS block's own instructions against). Seeded
+        # for the trace's start address (every register externally-tainted
+        # - see sym_initial_state - since at any given start address every
+        # register genuinely holds a value from outside this trace, most
+        # commonly an incoming argument); every _enqueue() call propagates
+        # one for its target, whether reached via auto-continue, a
+        # symbolic-resolved verdict, or an LLM verdict - see _enqueue.
+        self.sym_states = {start_ea: sym_initial_state()}
+
+        self.worker = None
+        self._closed = False
+        self._on_finished_cb = None
+        self._current_block = None
+        self._current_block_sym_state = None
+
+    # -- driving ------------------------------------------------------
+
+    def start(self, on_finished):
+        self._on_finished_cb = on_finished
+        # gather_block() reads and now also writes the database (instruction
+        # boundary fixups - see _fixup_instruction_boundary), so _pump()
+        # must run under MFF_WRITE, never called directly from a network
+        # callback context (see _on_decision_done/_on_decision_error below).
+        ida_kernwin.execute_sync(self._pump, ida_kernwin.MFF_WRITE)
+
+    def cancel(self):
+        self._closed = True
+        if self.worker is not None:
+            self.worker.cancel()
+
+    def _log(self, text):
+        self.trace_log.append(text)
+        self._on_log(text)
+
+    def _pump(self):
+        while True:
+            if self._closed:
+                return 0
+            if not self.worklist:
+                self._finish(partial=False)
+                return 0
+            if self.blocks_processed >= self.config.max_trace_blocks:
+                self._log(
+                    "Reached the max trace blocks cap (%d); stopping with a partial "
+                    "result. %d address(es) remain unexplored." % (self.config.max_trace_blocks, len(self.worklist))
+                )
+                self._finish(partial=True)
+                return 0
+            ea = self.worklist.popleft()
+            if ea in self.visited or ea in self.dead:
+                continue
+            # Note: deliberately NOT skipping ea in self._unresolved_eas here.
+            # worklist only ever contains addresses enqueued via _enqueue()
+            # (i.e. a REAL verdict) - a later conflicting DEAD/UNRESOLVED
+            # verdict for the same address flags it unresolved for review
+            # (first verdict wins) but must not stop it from actually being
+            # traced as real, or the conflict-flagged address would be
+            # silently dropped from the recovered path entirely.
+            self.blocks_processed += 1
+            block = gather_block(ea)
+            self._log("Block %#010x (%s, %d instr)" % (ea, block.kind, len(block.insn_eas)))
+
+            if block.kind in ("undecodable", "truncated"):
+                note = (
+                    "Address did not decode as a valid instruction." if block.kind == "undecodable"
+                    else "Hit the per-block instruction safety cap while decoding; needs manual review."
+                )
+                self._flag_unresolved(ea, note, self.predecessors.get(ea), block=block)
+                continue
+
+            self.visited[ea] = block
+
+            if block.kind == "return":
+                continue
+            if block.kind == "unconditional_jump":
+                target = block.successors[0].ea
+                if target is not None:
+                    sym_state = sym_run_block(self.sym_states.get(ea, SymState()), block.sym_insns, _family_of("rsp"))
+                    self._enqueue(target, ea, "auto-continue (only successor)", sym_state)
+                continue
+
+            # Genuine decision point: conditional_branch or indirect_jump.
+            # Try to resolve it via constant propagation first - this is
+            # what keeps LLM call count proportional to real obfuscation
+            # complexity rather than total decision-point count; falls
+            # back to the LLM whenever it cannot confidently resolve.
+            self._current_block = block
+            sym_state = sym_run_block(self.sym_states.get(ea, SymState()), block.sym_insns, _family_of("rsp"))
+            self._current_block_sym_state = sym_state
+            if self._try_symbolic_resolve(block, sym_state):
+                continue
+            self._issue_decision_request(block)
+            return 0
+
+    def _try_symbolic_resolve(self, block, sym_state):
+        """Attempts to resolve a decision point without an LLM call, via
+        the lightweight symbolic engine. Returns True (and has already
+        applied verdicts + advanced the worklist) if resolved; False if
+        the caller should fall back to the LLM as usual.
+        """
+        if not self.config.cfg_trace_use_symbolic:
+            return False
+        if block.kind == "conditional_branch":
+            if len(block.successors) != 2 or not block.sym_insns:
+                return False
+            last_mnem = block.sym_insns[-1].mnem
+            kind, verdicts = sym_resolve_conditional_branch(
+                sym_state, last_mnem, block.successors, _family_of("rcx")
+            )
+        elif block.kind == "indirect_jump":
+            if not block.sym_insns or not block.sym_insns[-1].operands:
+                return False
+            target_op = block.sym_insns[-1].operands[0]
+            kind, verdicts = sym_resolve_indirect_jump(sym_state, target_op, block.successors)
+        else:
+            return False
+        if kind == "unknown":
+            return False
+        self.symbolic_resolved_count += 1
+        self._log(
+            "Block %#010x resolved automatically via symbolic execution (%s) - no LLM call needed."
+            % (block.start_ea, "genuine data-dependent branch" if kind == "data_dependent" else "opaque predicate")
+        )
+        reason = (
+            "[symbolic] genuinely data-dependent branch - both paths are real"
+            if kind == "data_dependent" else "[symbolic] resolved via constant propagation"
+        )
+        for succ in block.successors:
+            if succ.ea is None or succ.ea not in verdicts:
+                continue
+            verdict = "real" if verdicts[succ.ea] else "dead"
+            self._apply_target_verdict(succ.ea, verdict, reason, block.start_ea)
+        return True
+
+    def _enqueue(self, ea, predecessor_ea, summary, sym_state=None):
+        if ea in self.visited or ea in self.queued or ea in self.dead:
+            return
+        self.queued.add(ea)
+        self.predecessors[ea] = predecessor_ea
+        self.decision_summary[ea] = summary
+        self.sym_states[ea] = sym_state.copy() if sym_state is not None else SymState()
+        self.worklist.append(ea)
+
+    def _finish(self, partial):
+        unexplored = list(self.worklist) if partial else []
+        result = self._build_result(partial, unexplored)
+        cb = self._on_finished_cb
+        self._on_finished_cb = None
+        if cb is not None:
+            cb(result)
+
+    def _build_result(self, partial, unexplored):
+        blocks = []
+        for ea, block in self.visited.items():
+            reason = self.decision_summary.get(ea) or ("Trace start" if ea == self.start_ea else "")
+            blocks.append(CfgTraceBlockRecord(
+                start_ea=block.start_ea, end_ea=block.end_ea, insn_eas=list(block.insn_eas),
+                verdict="real", reason=reason,
+            ))
+        for ea, block in self.dead_blocks.items():
+            blocks.append(CfgTraceBlockRecord(
+                start_ea=block.start_ea, end_ea=block.end_ea, insn_eas=list(block.insn_eas),
+                verdict="dead", reason=self.dead_reason.get(ea, ""),
+            ))
+        for item in self.unresolved:
+            block = item.get("block")
+            if block is not None:
+                blocks.append(CfgTraceBlockRecord(
+                    start_ea=block.start_ea, end_ea=block.end_ea, insn_eas=list(block.insn_eas),
+                    verdict="unresolved", reason=item.get("note", ""),
+                ))
+            else:
+                anchor = item.get("anchor_ea")
+                if anchor is not None:
+                    blocks.append(CfgTraceBlockRecord(
+                        start_ea=anchor, end_ea=anchor, insn_eas=[anchor],
+                        verdict="unresolved", reason=item.get("note", ""),
+                    ))
+        return CfgTraceResult(
+            blocks=blocks, partial=partial, blocks_processed=self.blocks_processed,
+            unexplored=unexplored, error=None, symbolic_resolved_count=self.symbolic_resolved_count,
+        )
+
+    # -- LLM round-trip for one decision point -------------------------
+
+    def _breadcrumb(self, ea):
+        chain = [ea]
+        cur = ea
+        seen = {ea}
+        while cur in self.predecessors:
+            cur = self.predecessors[cur]
+            if cur in seen:
+                break  # defensive: predecessors should never cycle, but never hang if it does
+            seen.add(cur)
+            chain.append(cur)
+        chain.reverse()
+        return chain
+
+    def _build_hop_prompt(self, block):
+        lines = [
+            "Trace stats: %d block(s) processed so far, %d confirmed real, %d confirmed "
+            "dead, %d unresolved so far." % (
+                self.blocks_processed, len(self.visited), len(self.dead), len(self.unresolved)
+            ),
+        ]
+        breadcrumb = self._breadcrumb(block.start_ea)
+        if len(breadcrumb) > 30:
+            lines.append("Path so far (earlier path abbreviated - showing last 30 of %d blocks):" % len(breadcrumb))
+            breadcrumb = breadcrumb[-30:]
+        else:
+            lines.append("Path so far (from trace start to this block):")
+        for i, ea in enumerate(breadcrumb):
+            marker = "  <- current block" if ea == block.start_ea else ""
+            summary = self.decision_summary.get(ea, "")
+            lines.append("  %d. %#010x%s%s" % (i + 1, ea, (" - " + summary) if summary else "", marker))
+        if self.trace_log:
+            lines.append("")
+            lines.append("Recent trace log:")
+            for entry in self.trace_log[-8:]:
+                lines.append("  " + entry)
+        lines.append("")
+        lines.append("Current block (%#010x - %#010x), kind=%s:" % (block.start_ea, block.end_ea, block.kind))
+        lines.append(block.text)
+        lines.append("")
+        lines.append("Candidates:")
+        for idx, succ in enumerate(block.successors):
+            if succ.ea is None:
+                note = (" (%s)" % succ.note) if succ.note else ""
+                lines.append("  %d. indirect target, not resolved by IDA%s" % (idx + 1, note))
+            else:
+                note = (" - %s" % succ.note) if succ.note else ""
+                lines.append("  %d. %#010x (%s)%s" % (idx + 1, succ.ea, succ.role, note))
+        return "\n".join(lines)
+
+    def _issue_decision_request(self, block):
+        prompt = self._build_hop_prompt(block)
+        messages = [
+            {"role": "system", "content": self.config.cfg_trace_system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        self._on_status(
+            "Asking %s about block %#010x (%d candidate(s))..."
+            % (self.config.server_label(self.server_url), block.start_ea, len(block.successors))
+        )
+        self.worker = LlamaStreamWorker(
+            self.config, self.server_url, messages,
+            lambda piece: None, lambda piece: None,
+            self._on_decision_done, self._on_decision_error,
+        )
+        self.worker.start()
+
+    def _next_fallback_server(self):
+        for candidate in self._server_candidates:
+            if candidate not in self._failed_servers:
+                return candidate
+        return None
+
+    def _on_decision_error(self, message, is_connection_error=False):
+        # Called via LlamaStreamWorker's MFF_FAST callback (see its run()) -
+        # per ida_kernwin's own docs, MFF_FAST must never touch the
+        # database, so only pure-Python/Qt-log work happens directly here;
+        # anything that calls gather_block/decode_insn is dispatched
+        # through _handle_unrecoverable_error under MFF_WRITE instead.
+        self.worker = None
+        if self._closed:
+            return 0
+        if is_connection_error and len(self._server_candidates) > 1:
+            self._failed_servers.add(self.server_url)
+            next_server = self._next_fallback_server()
+            if next_server is not None:
+                self._log(
+                    "%s is unreachable (%s); falling back to %s..."
+                    % (self.config.server_label(self.server_url), message, self.config.server_label(next_server))
+                )
+                self.server_url = next_server
+                self._issue_decision_request(self._current_block)  # starts a network thread only, no DB access
+                return 0
+        # Unrecoverable for this block: stop the whole trace here, keeping
+        # everything already decided, rather than guessing.
+        block = self._current_block
+        self._log("LLM request failed for block %#010x: %s" % (block.start_ea, message))
+        ida_kernwin.execute_sync(
+            functools.partial(self._handle_unrecoverable_error, block, message), ida_kernwin.MFF_WRITE
+        )
+        return 0
+
+    def _handle_unrecoverable_error(self, block, message):
+        self._flag_unresolved(
+            block.start_ea, "LLM request failed: %s" % message, self.predecessors.get(block.start_ea), block=block
+        )
+        self._finish(partial=True)
+        return 1
+
+    def _on_decision_done(self, full_text, reasoning_text="", finish_reason=None):
+        # Same MFF_FAST constraint as _on_decision_error above: _apply_decision
+        # (decode_insn probes) and _pump (gather_block, which now also
+        # writes) must run under MFF_WRITE, not directly on this callback.
+        self.worker = None
+        if self._closed:
+            return 0
+        ida_kernwin.execute_sync(
+            functools.partial(self._apply_decision_and_pump, self._current_block, full_text),
+            ida_kernwin.MFF_WRITE,
+        )
+        return 0
+
+    def _apply_decision_and_pump(self, block, text):
+        self._apply_decision(block, text)
+        self._pump()
+        return 1
+
+    # -- applying one block's LLM verdict, with structural defenses ---
+
+    def _target_state(self, ea):
+        if ea in self.visited or ea in self.queued:
+            return "real"
+        if ea in self.dead:
+            return "dead"
+        return None
+
+    def _apply_decision(self, block, text):
+        candidate_eas = {s.ea for s in block.successors if s.ea is not None}
+        single_unresolved_candidate = (
+            len(block.successors) == 1
+            and block.successors[0].ea is None
+            and block.successors[0].role == "unresolved"
+        )
+
+        def resolve_and_validate(token):
+            addr = _parse_trace_address(token)
+            if addr is None:
+                return None
+            if addr in candidate_eas:
+                return addr
+            if single_unresolved_candidate:
+                # The one case a novel address is legitimately allowed:
+                # a fully-unresolved indirect jump with no enumerated
+                # candidates at all - but only if it actually decodes.
+                try:
+                    probe = ida_ua.insn_t()
+                    if ida_ua.decode_insn(probe, addr) > 0:
+                        return addr
+                except Exception:
+                    pass
+            return None
+
+        addressed = set()
+        addressed_generic_indirect = False
+        verdicts = []  # (ea, verdict, reason)
+
+        for m in _REAL_TARGET_RE.finditer(text):
+            addr = resolve_and_validate(m.group(1))
+            if addr is None:
+                self._log("Block %#010x: ignored REAL_TARGET '%s' - not a valid candidate address." % (block.start_ea, m.group(1)))
+                continue
+            verdicts.append((addr, "real", (m.group(2) or "").strip()))
+            addressed.add(addr)
+
+        for m in _DEAD_TARGET_RE.finditer(text):
+            addr = resolve_and_validate(m.group(1))
+            if addr is None:
+                self._log("Block %#010x: ignored DEAD_TARGET '%s' - not a valid candidate address." % (block.start_ea, m.group(1)))
+                continue
+            verdicts.append((addr, "dead", (m.group(2) or "").strip()))
+            addressed.add(addr)
+
+        for m in _UNRESOLVED_TARGET_RE.finditer(text):
+            token = (m.group(1) or "").strip()
+            if token.lower() in ("indirect", "unknown", "n/a", "none"):
+                addressed_generic_indirect = True
+                self._flag_unresolved(
+                    None, (m.group(2) or "").strip() or "Model could not resolve this indirect target.",
+                    block.start_ea, anchor_ea=block.last_insn_ea,
+                )
+                continue
+            addr = resolve_and_validate(token)
+            if addr is None:
+                self._log("Block %#010x: ignored UNRESOLVED_TARGET '%s' - not a valid candidate address." % (block.start_ea, token))
+                continue
+            verdicts.append((addr, "unresolved", (m.group(2) or "").strip()))
+            addressed.add(addr)
+
+        for addr, verdict, reason in verdicts:
+            self._apply_target_verdict(addr, verdict, reason, block.start_ea)
+
+        # Omission defense: every candidate the block actually presented
+        # must have been addressed - anything left over is flagged for
+        # manual review, never silently assumed dead.
+        for succ in block.successors:
+            if succ.ea is None:
+                if not addressed_generic_indirect and not addressed and single_unresolved_candidate:
+                    self._log("Block %#010x: indirect jump target left unaddressed by the model." % block.start_ea)
+                    self._flag_unresolved(
+                        None, "Model gave no verdict for this indirect jump's target.",
+                        block.start_ea, anchor_ea=block.last_insn_ea,
+                    )
+                continue
+            if succ.ea not in addressed:
+                self._log(
+                    "Block %#010x: candidate %#010x was never addressed by the model - "
+                    "flagging for manual review." % (block.start_ea, succ.ea)
+                )
+                self._flag_unresolved(succ.ea, "Model did not address this candidate.", block.start_ea)
+
+    def _apply_target_verdict(self, addr, verdict, reason, predecessor_ea):
+        if addr in self._unresolved_eas and self._target_state(addr) is None:
+            # A later path resolves what an earlier path could not - this
+            # is an upgrade, not a conflict, so let it through.
+            self._unresolved_eas.discard(addr)
+            self.unresolved = [u for u in self.unresolved if u.get("ea") != addr]
+
+        existing = self._target_state(addr)
+        if verdict == "real":
+            if existing == "dead":
+                self._log(
+                    "Conflict at %#010x: already marked DEAD from another path, but block "
+                    "%#010x says REAL - keeping DEAD (first verdict wins)." % (addr, predecessor_ea)
+                )
+                self._flag_unresolved(
+                    addr, "Conflicting REAL/DEAD verdicts across different paths.", predecessor_ea,
+                    block=self.dead_blocks.get(addr), anchor_ea=addr,
+                )
+                return
+            if existing == "real":
+                return
+            summary = "REAL from %#010x" % predecessor_ea
+            if reason:
+                summary += ": " + reason
+            self.decision_summary[addr] = summary
+            self._log("Block %#010x -> %#010x marked REAL: %s" % (predecessor_ea, addr, reason or "(no reason given)"))
+            self._enqueue(addr, predecessor_ea, summary, self._current_block_sym_state)
+        elif verdict == "dead":
+            if existing == "real":
+                self._log(
+                    "Conflict at %#010x: already marked REAL from another path, but block "
+                    "%#010x says DEAD - keeping REAL (first verdict wins)." % (addr, predecessor_ea)
+                )
+                self._flag_unresolved(
+                    addr, "Conflicting REAL/DEAD verdicts across different paths.", predecessor_ea,
+                    block=self.visited.get(addr), anchor_ea=addr,
+                )
+                return
+            if existing == "dead":
+                return
+            self._log("Block %#010x -> %#010x marked DEAD: %s" % (predecessor_ea, addr, reason or "(no reason given)"))
+            self.dead.add(addr)
+            self.dead_reason[addr] = reason or ""
+            if addr not in self.dead_blocks:
+                try:
+                    self.dead_blocks[addr] = gather_block(addr)
+                except Exception:
+                    pass
+        else:  # "unresolved"
+            if existing is not None:
+                return  # already confidently resolved from another path - don't downgrade it
+            self._flag_unresolved(addr, reason or "Model flagged this target as unresolved.", predecessor_ea)
+
+    def _flag_unresolved(self, ea, note, predecessor_ea, block=None, anchor_ea=None):
+        """Marks ea (or, when ea is None, anchor_ea - the jump instruction
+        itself) as needing manual review. Does exactly one extra marking-
+        only gather_block() call (never enqueued, never counted against
+        max_trace_blocks) so the whole ambiguous region gets colored, not
+        just its entry byte.
+        """
+        if ea is not None:
+            if ea in self._unresolved_eas:
+                return
+            self._unresolved_eas.add(ea)
+            if block is None and ea not in self.visited and ea not in self.dead:
+                try:
+                    block = gather_block(ea)
+                except Exception:
+                    block = None
+        self.unresolved.append({
+            "ea": ea, "anchor_ea": anchor_ea, "note": note,
+            "predecessor": predecessor_ea, "block": block,
+        })
+
+
+_CfgTraceApplyItem = namedtuple("_CfgTraceApplyItem", ["insn_eas", "verdict", "comment"])
+
+
+def _apply_cfg_trace_and_refresh(config, items):
+    """One execute_sync/MFF_WRITE round-trip for the whole accepted set.
+    Mark/comment only, per the confirmed v1 scope - no byte patching.
+    Colors are idc.set_color's native 0xBBGGRR (BGR, not RGB) packed ints;
+    applied across every instruction in the block's range so the whole
+    marked region is visually distinct, while the comment itself is only
+    placed on the block's first instruction to avoid noisy per-line repeats.
+    """
+    color_by_verdict = {
+        "real": config.cfg_trace_color_real,
+        "dead": config.cfg_trace_color_dead,
+        "unresolved": config.cfg_trace_color_unresolved,
+    }
+    for item in items:
+        color = color_by_verdict.get(item.verdict)
+        for idx, ea in enumerate(item.insn_eas):
+            try:
+                if color is not None:
+                    idc.set_color(ea, idc.CIC_ITEM, color)
+                if idx == 0 and item.comment:
+                    idc.set_cmt(ea, item.comment, 0)
+            except Exception:
+                pass
+    try:
+        ida_kernwin.request_refresh(ida_kernwin.IWID_DISASM)
+    except Exception:
+        try:
+            ida_kernwin.refresh_idaview_anyway()
+        except Exception:
+            pass
+    return 1
+
+
+class CfgTraceDialog(QtWidgets.QDialog):
+    """Three phases in one dialog, matching this plugin's human-in-the-loop
+    philosophy (nothing is written to the database until Accept):
+      1. Confirm - an editable, cursor-prefilled start address.
+      2. Running - a live, cancellable transcript while CfgTraceRunner
+         works, pausing for an LLM round-trip only at real decision points.
+      3. Review - a checkbox table of every decided/flagged block; Accept
+         applies the checked rows in one batch (color + comment only).
+    """
+
+    COL_APPLY, COL_RANGE, COL_VERDICT, COL_REASON = range(4)
+
+    def __init__(self, config, start_ea, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.start_ea = start_ea
+        self.runner = None
+        self.result = None
+        self._log_lines_since_pump = 0
+
+        self.setWindowTitle("%s - Trace/Recover CFG" % PLUGIN_NAME)
+        self.resize(760, 560)
+
+        self.stack = QtWidgets.QStackedWidget()
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.addWidget(self.stack, 1)
+        _add_copyright_footer(outer)
+
+        self._build_confirm_page()
+        self._build_running_page()
+        self._build_review_page()
+        self.stack.setCurrentIndex(0)
+
+    # -- phase 1: confirm start address --------------------------------
+
+    def _build_confirm_page(self):
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        info = QtWidgets.QLabel(
+            "Traces basic blocks forward from the given address, asking the LLM at "
+            "each branch or indirect-jump decision point which successor(s) are the "
+            "real continuation of the original program and which are dead/decoy, "
+            "until the control flow is fully recovered (or the block cap is hit). As "
+            "it walks, it corrects any instruction boundaries IDA originally got "
+            "wrong (undefine + recreate, matching pressing U then C - never changes "
+            "a byte); this happens immediately, not deferred, since it's just fixing "
+            "IDA's own analysis. The REAL/DEAD/UNRESOLVED coloring and comments "
+            "themselves are NOT written until you review and accept the result on "
+            "the next screen."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QtWidgets.QFormLayout()
+        self.addr_edit = QtWidgets.QLineEdit("%#010x" % self.start_ea)
+        form.addRow("Start address:", self.addr_edit)
+        layout.addLayout(form)
+
+        self.confirm_status_label = QtWidgets.QLabel("")
+        palette = self.confirm_status_label.palette()
+        palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#a33"))
+        self.confirm_status_label.setPalette(palette)
+        layout.addWidget(self.confirm_status_label)
+        layout.addStretch(1)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch(1)
+        self.start_button = QtWidgets.QPushButton("Start")
+        self.start_button.clicked.connect(self._on_start_clicked)
+        button_row.addWidget(self.start_button)
+        cancel_button = QtWidgets.QPushButton("Cancel")
+        cancel_button.clicked.connect(self.close)
+        button_row.addWidget(cancel_button)
+        layout.addLayout(button_row)
+
+        self.stack.addWidget(page)
+
+    def _on_start_clicked(self):
+        text = self.addr_edit.text().strip()
+        ea = idaapi.BADADDR
+        for base in (0, 16):
+            try:
+                ea = int(text, base)
+                break
+            except ValueError:
+                continue
+        if ea == idaapi.BADADDR:
+            self.confirm_status_label.setText("Could not parse that as an address.")
+            return
+        probe = ida_ua.insn_t()
+        try:
+            decoded = ida_ua.decode_insn(probe, ea) > 0
+        except Exception:
+            decoded = False
+        if not decoded:
+            self.confirm_status_label.setText("%#010x does not decode as a valid instruction." % ea)
+            return
+        self.start_ea = ea
+        self._begin_trace()
+
+    # -- phase 2: running -------------------------------------------------
+
+    def _build_running_page(self):
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        self.running_status_label = QtWidgets.QLabel("Starting...")
+        layout.addWidget(self.running_status_label)
+        self.log_edit = QtWidgets.QPlainTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setFont(QtGui.QFont("Consolas", 9))
+        layout.addWidget(self.log_edit, 1)
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch(1)
+        self.running_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.running_cancel_button.clicked.connect(self._on_cancel_trace)
+        button_row.addWidget(self.running_cancel_button)
+        layout.addLayout(button_row)
+        self.stack.addWidget(page)
+
+    def _begin_trace(self):
+        self.stack.setCurrentIndex(1)
+        self.log_edit.clear()
+        self._log_lines_since_pump = 0
+        self.runner = CfgTraceRunner(
+            self.config, self.start_ea, on_log=self._on_trace_log, on_status=self._on_trace_status,
+        )
+        self.runner.start(self._on_trace_finished)
+
+    def _on_trace_log(self, text):
+        try:
+            self.log_edit.appendPlainText(text)
+        except RuntimeError:
+            return
+        # Even a long silent auto-resolve chain (zero LLM calls) should keep
+        # the log visibly growing and Cancel responsive, not freeze the UI
+        # until the next network round-trip.
+        self._log_lines_since_pump += 1
+        if self._log_lines_since_pump >= 20:
+            self._log_lines_since_pump = 0
+            QtWidgets.QApplication.processEvents()
+
+    def _on_trace_status(self, text):
+        try:
+            self.running_status_label.setText(text)
+        except RuntimeError:
+            pass
+
+    def _on_cancel_trace(self):
+        if self.runner is not None:
+            self.runner.cancel()
+        self.close()
+
+    def _on_trace_finished(self, result):
+        self.result = result
+        self._populate_review(result)
+        self.stack.setCurrentIndex(2)
+
+    # -- phase 3: review ----------------------------------------------------
+
+    def _build_review_page(self):
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        self.summary_label = QtWidgets.QLabel("")
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        self.review_table = QtWidgets.QTableWidget(0, 4)
+        self.review_table.setHorizontalHeaderLabels(["Apply", "Address range", "Verdict", "Reason"])
+        self.review_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.review_table, 1)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch(1)
+        self.accept_button = QtWidgets.QPushButton("Accept && Mark Disassembly")
+        self.accept_button.clicked.connect(self._on_accept)
+        button_row.addWidget(self.accept_button)
+        close_button = QtWidgets.QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        self.stack.addWidget(page)
+
+    def _populate_review(self, result):
+        status = "Partial (block cap reached)" if result.partial else "Complete"
+        real_n = sum(1 for b in result.blocks if b.verdict == "real")
+        dead_n = sum(1 for b in result.blocks if b.verdict == "dead")
+        unresolved_n = sum(1 for b in result.blocks if b.verdict == "unresolved")
+        extra = " %d address(es) left unexplored." % len(result.unexplored) if result.unexplored else ""
+        sym_note = (
+            " %d decision point(s) resolved automatically (no LLM call)." % result.symbolic_resolved_count
+            if result.symbolic_resolved_count else ""
+        )
+        self.summary_label.setText(
+            "%s - %d block(s) processed. %d real, %d dead, %d unresolved.%s%s"
+            % (status, result.blocks_processed, real_n, dead_n, unresolved_n, sym_note, extra)
+        )
+
+        rows = sorted(result.blocks, key=lambda r: (r.start_ea, r.verdict))
+        self.review_table.setRowCount(len(rows))
+        self._review_rows = rows
+        for i, rec in enumerate(rows):
+            check_item = QtWidgets.QTableWidgetItem()
+            check_item.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+            default_checked = rec.verdict in ("real", "dead")
+            check_item.setCheckState(
+                QtCore.Qt.CheckState.Checked if default_checked else QtCore.Qt.CheckState.Unchecked
+            )
+            self.review_table.setItem(i, self.COL_APPLY, check_item)
+            range_text = (
+                "%#010x" % rec.start_ea if rec.start_ea == rec.end_ea
+                else "%#010x - %#010x" % (rec.start_ea, rec.end_ea)
+            )
+            self.review_table.setItem(i, self.COL_RANGE, QtWidgets.QTableWidgetItem(range_text))
+            self.review_table.setItem(i, self.COL_VERDICT, QtWidgets.QTableWidgetItem(rec.verdict.upper()))
+            self.review_table.setItem(i, self.COL_REASON, QtWidgets.QTableWidgetItem(rec.reason))
+
+    def _build_comment(self, rec):
+        prefix = {
+            "real": "[CFG trace: real path]",
+            "dead": "[CFG trace: dead/decoy]",
+            "unresolved": "[CFG trace: unresolved - needs manual review]",
+        }[rec.verdict]
+        return "%s %s" % (prefix, rec.reason) if rec.reason else prefix
+
+    def _on_accept(self):
+        items = []
+        for i, rec in enumerate(self._review_rows):
+            if self.review_table.item(i, self.COL_APPLY).checkState() != QtCore.Qt.CheckState.Checked:
+                continue
+            items.append(_CfgTraceApplyItem(
+                insn_eas=rec.insn_eas, verdict=rec.verdict, comment=self._build_comment(rec),
+            ))
+        if not items:
+            self.close()
+            return
+        ida_kernwin.execute_sync(
+            functools.partial(_apply_cfg_trace_and_refresh, self.config, items), ida_kernwin.MFF_WRITE
+        )
+        self.accept_button.setEnabled(False)
+        self.close()
+
+    def closeEvent(self, event):
+        if self.runner is not None:
+            self.runner.cancel()
+        super().closeEvent(event)
+
+
+# ---------------------------------------------------------------------------
 # IDA action / popup / plugin glue
 # ---------------------------------------------------------------------------
 
@@ -2343,12 +4316,46 @@ class BatchActionHandler(ida_kernwin.action_handler_t):
         return ida_kernwin.AST_ENABLE_ALWAYS
 
 
+class CfgTraceActionHandler(ida_kernwin.action_handler_t):
+    """Disassembly-only (see update()): unlike ExplainActionHandler, this
+    does NOT gate on _resolve_func succeeding - the whole premise is a
+    blob that may not be recognized as a function at all, and every
+    primitive this feature needs (decode_insn, CodeRefsFrom, switch_info_t)
+    is instruction-address-level, not function-level.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def activate(self, ctx):
+        ea = ida_kernwin.get_screen_ea()
+        if ea == idaapi.BADADDR:
+            ida_kernwin.warning("Place the cursor on an address first.")
+            return 0
+        plugin = LLMExplainerPlugin.instance
+        if plugin is None:
+            return 0
+        plugin.open_cfg_trace_dialog(ea)
+        return 1
+
+    def update(self, ctx):
+        widget = getattr(ctx, "widget", None)
+        wtype = ida_kernwin.get_widget_type(widget) if widget else -1
+        if wtype != ida_kernwin.BWN_DISASM:
+            return ida_kernwin.AST_DISABLE_FOR_WIDGET
+        return ida_kernwin.AST_ENABLE_FOR_WIDGET
+
+
 class PopupHooks(ida_kernwin.UI_Hooks):
     def finish_populating_widget_popup(self, widget, popup, ctx=None):
         wtype = ida_kernwin.get_widget_type(widget)
-        if wtype in (ida_kernwin.BWN_PSEUDOCODE, ida_kernwin.BWN_DISASM):
+        if wtype == ida_kernwin.BWN_PSEUDOCODE:
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN, "LLM Explainer/")
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN_RECURSIVE, "LLM Explainer/")
+        elif wtype == ida_kernwin.BWN_DISASM:
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN_RECURSIVE, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_TRACE_CFG, "LLM Explainer/")
         elif wtype == ida_kernwin.BWN_FUNCS:
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_BATCH, "LLM Explainer/")
 
@@ -2363,8 +4370,11 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         "(recursively)', which additionally explains the function's direct "
         "callees and automatically applies every result without a review "
         "step - use with care. Right-click in the Functions window to "
-        "batch-explain multiple functions. Edit > Plugins > LLM Explainer "
-        "opens settings."
+        "batch-explain multiple functions. In the disassembly view, "
+        "'Trace/Recover CFG...' asks the LLM to walk an obfuscated "
+        "function's real control flow branch by branch and mark real/dead "
+        "code (color + comment only, no byte patching). Edit > Plugins > "
+        "LLM Explainer opens settings."
     )
     wanted_name = PLUGIN_NAME
     wanted_hotkey = ""
@@ -2378,6 +4388,7 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         self._action_handler = ExplainActionHandler()
         self._recursive_action_handler = ExplainRecursiveActionHandler()
         self._batch_action_handler = BatchActionHandler()
+        self._trace_cfg_action_handler = CfgTraceActionHandler()
 
         action = ida_kernwin.action_desc_t(
             ACTION_ID_EXPLAIN,
@@ -2418,6 +4429,18 @@ class LLMExplainerPlugin(idaapi.plugin_t):
             )
         except Exception:
             pass
+
+        trace_cfg_action = ida_kernwin.action_desc_t(
+            ACTION_ID_TRACE_CFG,
+            "Trace/Recover CFG...",
+            self._trace_cfg_action_handler,
+            None,
+            "Ask the local LLM to trace this obfuscated function's real control "
+            "flow, branch by branch, and mark real/dead code in the disassembly",
+            -1,
+        )
+        if not ida_kernwin.register_action(trace_cfg_action):
+            ida_kernwin.msg("[%s] Failed to register CFG trace action.\n" % PLUGIN_NAME)
 
         self._popup_hooks = PopupHooks()
         self._popup_hooks.hook()
@@ -2480,6 +4503,10 @@ class LLMExplainerPlugin(idaapi.plugin_t):
             ida_kernwin.unregister_action(ACTION_ID_BATCH)
         except Exception:
             pass
+        try:
+            ida_kernwin.unregister_action(ACTION_ID_TRACE_CFG)
+        except Exception:
+            pass
         LLMExplainerPlugin.instance = None
 
     def _track_dialog(self, dlg):
@@ -2502,6 +4529,10 @@ class LLMExplainerPlugin(idaapi.plugin_t):
 
     def open_batch_dialog(self, funcs):
         dlg = BatchProgressDialog(self.config, funcs)
+        return self._track_dialog(dlg)
+
+    def open_cfg_trace_dialog(self, start_ea):
+        dlg = CfgTraceDialog(self.config, start_ea)
         return self._track_dialog(dlg)
 
     def open_recursive_explain(self, func):
