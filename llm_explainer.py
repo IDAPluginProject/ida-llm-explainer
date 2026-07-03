@@ -88,12 +88,20 @@ byte), the same "U then C" fixup a human would do manually - since
 obfuscated code routinely has real jump targets landing mid-instruction
 relative to IDA's initial linear-sweep guess; this happens immediately
 as part of walking, not deferred to Accept, since it is just correcting
-IDA's own analysis rather than expressing an LLM opinion. Once the trace
-finishes, a review table lets you check/uncheck each decided block before
-Accept - v1 only colors the disassembly and adds a comment for the
-REAL/DEAD/UNRESOLVED verdicts themselves (no byte patching, no NOPing
-dead code, no branch rewriting), matching this plugin's human-in-the-loop
-rule.
+IDA's own analysis rather than expressing an LLM opinion. An optional
+live graph view (a native IDA graph, colored to match the eventual
+disassembly marking) fills in as the trace runs, alongside the transcript.
+Once the trace finishes, a review table lets you check/uncheck each
+decided block before Accept, which by default only colors the disassembly
+and adds a comment for the REAL/DEAD/UNRESOLVED verdicts themselves - no
+byte patching. An opt-in "Also patch bytes" checkbox (unchecked by
+default, with a confirmation prompt) additionally NOPs confirmed dead
+code and redirects confirmed opaque-predicate jumps (Jcc -> JMP toward
+the real target, or NOP if the real path is the fallthrough) straight to
+their real target, so the recovered function can be handed to Hex-Rays.
+Every patch is computed from freshly re-decoded, verified bytes right
+before writing and refuses (leaving the original bytes untouched) rather
+than guessing at anything it doesn't fully recognize.
 """
 
 import functools
@@ -101,6 +109,7 @@ import json
 import os
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections import deque, namedtuple
@@ -109,8 +118,10 @@ import idaapi
 import idautils
 import idc
 import ida_kernwin
+import ida_auto
 import ida_bytes
 import ida_funcs
+import ida_graph
 import ida_idp
 import ida_lines
 import ida_name
@@ -134,7 +145,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -981,12 +992,16 @@ _SYM_WIDTH_MASK = {1: 0xFF, 2: 0xFFFF, 4: 0xFFFFFFFF, 8: 0xFFFFFFFFFFFFFFFF}
 #   imm:         family=None, value=int,                            width=bytes
 #   mem_direct:  family=None, value=absolute address,                width=bytes
 #   mem_simple:  family=base GPR family, value=raw displacement,     width=bytes
-#     (no index/scale field at all - indexed/SIB addressing is rejected
-#     at the adapter layer below, before it can ever reach this engine,
-#     since decoding it isn't safely reachable from documented op_t
-#     fields without the C++ SDK headers)
-#   unsupported: family=None, value=None, width=None
-SymOperand = namedtuple("SymOperand", ["kind", "family", "value", "width"])
+#     (round-trip write/read-back tracked in SymState.mem, keyed by
+#     (family, disp) - see SymState docstring)
+#   mem_indexed: family=None, value=raw displacement, terms=((family,scale), ...)
+#     (1 or 2 (family, scale) pairs - scale in {1,2,4,8}; base+index*scale
+#     addressing, e.g. [rcx+rdx*4] or [rax*8+table]. Read-only: the
+#     effective address is recomputed fresh from current register values
+#     every time, never round-trip-tracked in SymState.mem, so there is
+#     no staleness/invalidation concern for this kind at all)
+#   unsupported: family=None, value=None, width=None, terms=None
+SymOperand = namedtuple("SymOperand", ["kind", "family", "value", "width", "terms"], defaults=(None,))
 SymInsn = namedtuple("SymInsn", ["mnem", "operands"])
 _UNSUPPORTED_OPERAND = SymOperand(kind="unsupported", family=None, value=None, width=None)
 
@@ -1079,6 +1094,29 @@ def _sym_read_static_memory(addr, width):
     return EXTERNAL if writable else value
 
 
+def _sym_resolve_indexed_address(state, op):
+    """Computes the effective address of a mem_indexed operand from
+    CURRENT register values - never cached/round-trip-tracked, so there
+    is nothing to invalidate on a later register write (unlike
+    mem_simple's SymState.mem slots): this just recomputes fresh every
+    time it's asked. Returns an int, EXTERNAL, or None (unsupported),
+    with None taking precedence over EXTERNAL - see _sym_combine.
+    """
+    addr = op.value
+    saw_external = False
+    for family, scale in op.terms:
+        v = state.regs.get(family)
+        if v is None:
+            return None
+        if v is EXTERNAL:
+            saw_external = True
+        else:
+            addr += v * scale
+    if saw_external:
+        return EXTERNAL
+    return addr & _SYM_WIDTH_MASK[8]
+
+
 def _sym_resolve_operand(state, op):
     if op.kind == "imm":
         return op.value & _SYM_WIDTH_MASK[op.width]
@@ -1096,6 +1134,11 @@ def _sym_resolve_operand(state, op):
         if base_val is EXTERNAL:
             return EXTERNAL
         addr = (base_val + op.value) & _SYM_WIDTH_MASK[8]
+        return _sym_read_static_memory(addr, op.width)
+    if op.kind == "mem_indexed":
+        addr = _sym_resolve_indexed_address(state, op)
+        if addr is None or addr is EXTERNAL:
+            return addr
         return _sym_read_static_memory(addr, op.width)
     return None
 
@@ -1117,7 +1160,7 @@ def _sym_write_dest(state, dst_op, value):
             state.mem[key] = (value, dst_op.width)
         return
     if dst_op.kind != "reg":
-        return  # mem_direct / unsupported destinations are not tracked
+        return  # mem_direct / mem_indexed / unsupported destinations are not tracked
     if dst_op.width not in (4, 8):
         # 8/16-bit partial-register writes don't clear the rest of the
         # register on real hardware and we don't model that precisely -
@@ -1166,6 +1209,12 @@ def _sym_h_lea(state, ops):
         else:
             addr = (base_val + src.value) & _SYM_WIDTH_MASK[8]
             _sym_write_dest(state, dst, addr & _SYM_WIDTH_MASK[dst.width])
+        return
+    if src.kind == "mem_indexed":
+        addr = _sym_resolve_indexed_address(state, src)
+        if isinstance(addr, int):
+            addr &= _SYM_WIDTH_MASK[dst.width]
+        _sym_write_dest(state, dst, addr)
         return
     _sym_write_dest(state, dst, None)
 
@@ -1323,6 +1372,26 @@ _SYM_INSN_HANDLERS = {
     # in sym_run_block below rather than through this plain handler dict.
 }
 
+_sym_control_flow_mnemonics_cache = None
+
+
+def _sym_control_flow_mnemonics():
+    """Mnemonics that end a basic block (every Jcc variant, jcxz/ecxz/
+    rcxz, and jmp) have no DATA effect of their own to model - gather_block
+    always includes the block's own terminating instruction as the LAST
+    entry of sym_insns (so sym_resolve_indirect_jump can read a trailing
+    jmp's target operand), and sym_run_block must treat these as a pure
+    no-op rather than "an unmodeled instruction" (which would otherwise
+    reset the state - including last_cmp/last_flags - on literally the
+    last instruction of every conditional-branch block, immediately
+    before CfgTraceRunner reads them to resolve the branch; this was a
+    real bug, not just an unmodeled-instruction fallback).
+    """
+    global _sym_control_flow_mnemonics_cache
+    if _sym_control_flow_mnemonics_cache is None:
+        _sym_control_flow_mnemonics_cache = set(_SYM_CONDITION_EVALUATORS) | {"jcxz", "jecxz", "jrcxz", "jmp"}
+    return _sym_control_flow_mnemonics_cache
+
 
 def sym_run_block(state, sym_insns, rsp_family):
     """Executes a linear sequence of SymInsn against a COPY of state,
@@ -1363,6 +1432,10 @@ def sym_run_block(state, sym_insns, rsp_family):
                 state.regs = dict(_sym_all_external_regs())
                 state.last_cmp = None
                 state.last_flags = None
+                continue
+            if mnem in _sym_control_flow_mnemonics():
+                # The block's own terminating branch/jump - no data effect
+                # to model, must not disturb last_cmp/last_flags/regs.
                 continue
             handler = _SYM_INSN_HANDLERS.get(mnem)
             if handler is None:
@@ -1566,31 +1639,87 @@ _NUMERIC_TERM_RE = re.compile(r"^[+-]?(?:0[xX][0-9a-fA-F]+|[0-9A-Fa-f]+[hH]?|\d+
 _PTR_PREFIX_RE = re.compile(r"^(?:byte|word|dword|qword|xmmword|ymmword|zmmword)\s+ptr\s+(.*)$", re.IGNORECASE)
 
 
-def _operand_looks_indexed(ea, opnum):
-    """True if this memory operand's rendered text suggests more than a
-    simple base+displacement (a second register term, or an explicit
-    scale factor). SIB (base+index*scale) decoding isn't safely reachable
-    from documented op_t fields without the C++ SDK headers (not shipped
-    with this install), so any operand that MIGHT be indexed is rejected
-    here rather than guessed at - the engine never sees it, so it always
-    falls back to the LLM for these rather than risking a wrong read.
+_SCALE_RE = re.compile(r"^([A-Za-z0-9]+)\*([0-9]+)$")
+
+
+def _parse_memory_operand_text(ea, opnum):
+    """Parses a memory operand's base/index/scale registers directly from
+    IDA's own RENDERED text (idc.print_operand), rather than the raw
+    op_t SIB fields - those aren't safely decodable from documented
+    Python fields without the C++ SDK headers (not shipped with this
+    install), so guessing at their bit layout was judged too risky.
+    Register NAMES and small integer SCALE factors are low-risk,
+    well-defined tokens to pull out of text; the numeric displacement
+    itself always comes from the structured op.addr field instead (see
+    _extract_sym_operand), never from here.
+
+    Returns (base_family_or_None, index_family_or_None, scale) - scale
+    is only meaningful when index is not None - or None if the text
+    can't be confidently parsed this way (caller must treat that as
+    unsupported and fall back to the LLM, never guess). Assumes IDA's
+    default Intel-syntax bracket rendering; a database configured for
+    AT&T syntax will simply fail to parse here and fall back the same
+    safe way.
     """
     try:
         text = idc.print_operand(ea, opnum) or ""
     except Exception:
-        return True
+        return None
     text = text.strip()
     m = _PTR_PREFIX_RE.match(text)
     if m:
         text = m.group(1).strip()
     if not (text.startswith("[") and text.endswith("]")):
-        return True
+        return None
     inner = text[1:-1]
-    if "*" in inner:
-        return True
-    terms = re.findall(r"[+-]?[^+-]+", inner)
-    reg_like = [t for t in terms if not _NUMERIC_TERM_RE.match(t.strip())]
-    return len(reg_like) > 1
+
+    reg_terms = []  # (family, scale_or_None)
+    for raw_term in re.findall(r"[+-]?[^+-]+", inner):
+        term = raw_term.strip()
+        if not term:
+            continue
+        if term[0] in "+-":
+            sign, body = term[0], term[1:].strip()
+        else:
+            sign, body = "+", term
+        if _NUMERIC_TERM_RE.match(body):
+            continue  # displacement - comes from op.addr instead, not here
+        if sign == "-":
+            return None  # a negated register term isn't an addressing form we handle
+        scale_match = _SCALE_RE.match(body)
+        if scale_match:
+            reg_name, scale_str = scale_match.group(1), scale_match.group(2)
+            scale_val = int(scale_str)
+            if scale_val not in (1, 2, 4, 8):
+                return None
+        else:
+            reg_name, scale_val = body, None
+        fam = _family_of(reg_name.lower())
+        if fam is None or fam not in _gpr_family_set():
+            return None  # unrecognized register (segment override, rip, xmm, ...) -> unsupported
+        reg_terms.append((fam, scale_val))
+
+    if len(reg_terms) == 0:
+        return (None, None, 1)
+    if len(reg_terms) == 1:
+        fam, sc = reg_terms[0]
+        return (fam, None, 1) if sc is None else (None, fam, sc)
+    if len(reg_terms) == 2:
+        scaled = [t for t in reg_terms if t[1] is not None]
+        unscaled = [t for t in reg_terms if t[1] is None]
+        if len(scaled) == 1 and len(unscaled) == 1:
+            return (unscaled[0][0], scaled[0][0], scaled[0][1])
+        if len(scaled) == 0:
+            # Neither term has an explicit *scale (e.g. "[rax+rbx]"), so
+            # which one is "base" vs "index" is genuinely ambiguous from
+            # text alone - but it doesn't matter: with scale 1 on both,
+            # the effective-address sum is identical either way, and
+            # mem_indexed operands are never round-trip-tracked (unlike
+            # mem_simple), so there is no "wrong base for invalidation
+            # purposes" concern here either.
+            return (reg_terms[0][0], reg_terms[1][0], 1)
+        return None  # both terms explicitly scaled - not a real addressing form, bail
+    return None  # 3+ register terms - unexpected, bail out rather than guess
 
 
 def _extract_sym_operand(ea, opnum, op):
@@ -1608,17 +1737,48 @@ def _extract_sym_operand(ea, opnum, op):
             return _UNSUPPORTED_OPERAND
         return SymOperand(kind="mem_direct", family=None, value=op.addr, width=width)
     if op.type in (ida_ua.o_displ, ida_ua.o_phrase):
-        if width is None or op.reg not in _gpr_family_set():
+        if width is None:
             return _UNSUPPORTED_OPERAND
-        if _operand_looks_indexed(ea, opnum):
+        parsed = _parse_memory_operand_text(ea, opnum)
+        if parsed is None:
             return _UNSUPPORTED_OPERAND
+        base, index, scale = parsed
         disp = op.addr if op.type == ida_ua.o_displ else 0
-        return SymOperand(kind="mem_simple", family=op.reg, value=disp, width=width)
+        if index is None:
+            if base is None:
+                return _UNSUPPORTED_OPERAND
+            return SymOperand(kind="mem_simple", family=base, value=disp, width=width)
+        terms = ((index, scale),) if base is None else ((base, 1), (index, scale))
+        return SymOperand(kind="mem_indexed", family=None, value=disp, width=width, terms=terms)
     return _UNSUPPORTED_OPERAND
+
+
+_sym_modeled_mnemonics_cache = None
+
+
+def _sym_modeled_mnemonics():
+    global _sym_modeled_mnemonics_cache
+    if _sym_modeled_mnemonics_cache is None:
+        # "jmp" is the one control-flow mnemonic whose OPERAND is actually
+        # read afterward (sym_resolve_indirect_jump needs a trailing
+        # indirect jmp's target operand) - every Jcc/jcxz variant only
+        # ever has its .mnem looked at (by sym_resolve_conditional_branch),
+        # never its operands, so they correctly stay out of this set.
+        _sym_modeled_mnemonics_cache = set(_SYM_INSN_HANDLERS) | {"push", "pop", "jmp"}
+    return _sym_modeled_mnemonics_cache
 
 
 def _extract_sym_insn(ea, insn):
     mnem = (insn.get_canon_mnem() or "").lower()
+    if mnem not in _sym_modeled_mnemonics():
+        # sym_run_block resets the whole state for any unmodeled mnemonic
+        # regardless of its operands, so extracting them (including the
+        # idc.print_operand-based indexed-addressing check below, which
+        # is the most expensive part of this) would be pure waste - most
+        # of a typical function's instructions are NOT in the modeled
+        # whitelist, so skipping this is a meaningful chunk of the
+        # per-instruction cost of walking a large function.
+        return SymInsn(mnem=mnem, operands=())
     operands = []
     for i in range(8):
         op = insn.ops[i]
@@ -1626,6 +1786,25 @@ def _extract_sym_insn(ea, insn):
             break
         operands.append(_extract_sym_operand(ea, i, op))
     return SymInsn(mnem=mnem, operands=tuple(operands))
+
+
+def render_block_text(insn_eas):
+    """Renders disassembly text for a block on demand. NOT called during
+    the main gather_block() walk - text is only ever needed for an LLM
+    prompt (rare: only when a decision point can't be resolved
+    symbolically) or a graph-view tooltip (only when the user actually
+    hovers a node) - generating it unconditionally for every instruction
+    of every block, most of which are never looked at again, was a
+    meaningful chunk of wall-clock time on any function of real size.
+    """
+    lines = []
+    for ea in insn_eas:
+        try:
+            line = idc.generate_disasm_line(ea, idc.GENDSM_REMOVE_TAGS)
+        except Exception:
+            line = idc.GetDisasm(ea)
+        lines.append("%#010x  %s" % (ea, ida_lines.tag_remove(line) if line else ""))
+    return "\n".join(lines)
 
 
 def gather_block(start_ea, max_instrs=_MAX_BLOCK_INSTRS):
@@ -1637,13 +1816,16 @@ def gather_block(start_ea, max_instrs=_MAX_BLOCK_INSTRS):
     touching bytes) as it walks, before relying on it for anything -
     obfuscated code frequently has real code starting mid-way through
     what IDA's original analysis mis-disassembled as one bigger
-    instruction, and both the displayed text and CodeRefsFrom's branch-
-    target resolution below are only correct once that's fixed. This is
-    the one place this feature writes to the database outside of the
-    user's explicit Accept step; see CfgTraceRunner for how these calls
-    are kept off LlamaStreamWorker's MFF_FAST callback thread context.
+    instruction, and CodeRefsFrom's branch-target resolution below is
+    only correct once that's fixed. This is the one place this feature
+    writes to the database outside of the user's explicit Accept step;
+    see CfgTraceRunner for how these calls are kept off
+    LlamaStreamWorker's MFF_FAST callback thread context.
+
+    BlockInfo.text is intentionally left empty here - call
+    render_block_text(block.insn_eas) if you actually need it (see that
+    function's docstring for why this is lazy).
     """
-    lines = []
     insn_eas = []
     sym_insns = []
     ea = start_ea
@@ -1651,22 +1833,12 @@ def gather_block(start_ea, max_instrs=_MAX_BLOCK_INSTRS):
         insn = ida_ua.insn_t()
         size = ida_ua.decode_insn(insn, ea)
         if size <= 0:
-            try:
-                line = idc.generate_disasm_line(ea, idc.GENDSM_REMOVE_TAGS)
-            except Exception:
-                line = idc.GetDisasm(ea)
-            lines.append("%#010x  %s" % (ea, ida_lines.tag_remove(line) if line else "(undecodable)"))
             return BlockInfo(
-                start_ea=start_ea, end_ea=ea, text="\n".join(lines), kind="undecodable",
+                start_ea=start_ea, end_ea=ea, text="", kind="undecodable",
                 successors=[], last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
             )
         _fixup_instruction_boundary(ea, size)
         insn_eas.append(ea)
-        try:
-            line = idc.generate_disasm_line(ea, idc.GENDSM_REMOVE_TAGS)
-        except Exception:
-            line = idc.GetDisasm(ea)
-        lines.append("%#010x  %s" % (ea, ida_lines.tag_remove(line) if line else ""))
 
         feature = insn.get_canon_feature()
         is_call = bool(feature & ida_idp.CF_CALL)
@@ -1706,14 +1878,14 @@ def gather_block(start_ea, max_instrs=_MAX_BLOCK_INSTRS):
             successors.append(BlockSuccessor(ea=next_ea, role="fallthrough", case_values=None, note=None))
             kind = "conditional_branch" if len(successors) > 1 else "unconditional_jump"
             return BlockInfo(
-                start_ea=start_ea, end_ea=next_ea, text="\n".join(lines), kind=kind,
+                start_ea=start_ea, end_ea=next_ea, text="", kind=kind,
                 successors=successors, last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
             )
 
         if is_indirect:
             successors = _resolve_indirect_jump_successors(ea)
             return BlockInfo(
-                start_ea=start_ea, end_ea=next_ea, text="\n".join(lines), kind="indirect_jump",
+                start_ea=start_ea, end_ea=next_ea, text="", kind="indirect_jump",
                 successors=successors, last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
             )
 
@@ -1725,25 +1897,25 @@ def gather_block(start_ea, max_instrs=_MAX_BLOCK_INSTRS):
             pass
         if not explicit_targets:
             return BlockInfo(
-                start_ea=start_ea, end_ea=next_ea, text="\n".join(lines), kind="return",
+                start_ea=start_ea, end_ea=next_ea, text="", kind="return",
                 successors=[], last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
             )
         if len(explicit_targets) == 1:
             successors = [BlockSuccessor(ea=explicit_targets[0], role="jump_target", case_values=None, note=None)]
             return BlockInfo(
-                start_ea=start_ea, end_ea=next_ea, text="\n".join(lines), kind="unconditional_jump",
+                start_ea=start_ea, end_ea=next_ea, text="", kind="unconditional_jump",
                 successors=successors, last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
             )
         successors = [
             BlockSuccessor(ea=t, role="jump_target", case_values=None, note=None) for t in explicit_targets
         ]
         return BlockInfo(
-            start_ea=start_ea, end_ea=next_ea, text="\n".join(lines), kind="conditional_branch",
+            start_ea=start_ea, end_ea=next_ea, text="", kind="conditional_branch",
             successors=successors, last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
         )
 
     return BlockInfo(
-        start_ea=start_ea, end_ea=ea, text="\n".join(lines), kind="truncated",
+        start_ea=start_ea, end_ea=ea, text="", kind="truncated",
         successors=[], last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
     )
 
@@ -3436,7 +3608,19 @@ def _parse_trace_address(token):
 CfgTraceBlockRecord = namedtuple("CfgTraceBlockRecord", ["start_ea", "end_ea", "insn_eas", "verdict", "reason"])
 
 CfgTraceResult = namedtuple(
-    "CfgTraceResult", ["blocks", "partial", "blocks_processed", "unexplored", "error", "symbolic_resolved_count"]
+    "CfgTraceResult",
+    ["blocks", "partial", "blocks_processed", "unexplored", "error", "symbolic_resolved_count", "jump_patches"],
+)
+
+# A fully-resolved binary opaque predicate found during the trace: a
+# conditional_branch block whose two successors have opposite verdicts
+# (one real, one dead) - the only case eligible for jump patching. NOT
+# emitted for genuine data-dependent branches (both real) or anything
+# involving an unresolved successor - see CfgTraceRunner._build_result.
+# role_of_real: "jump_target" | "fallthrough" - which side of the
+# original Jcc is the real one, determining how to patch it.
+CfgTraceJumpPatch = namedtuple(
+    "CfgTraceJumpPatch", ["jcc_ea", "real_target_ea", "dead_target_ea", "role_of_real"]
 )
 
 
@@ -3627,6 +3811,16 @@ class CfgTraceRunner(object):
             cb(result)
 
     def _build_result(self, partial, unexplored):
+        # Documented v1 simplification (see gather_block): a later real
+        # path jumping into the middle of an earlier block's range can
+        # produce a second, overlapping BlockInfo record. Harmless for
+        # coloring (idempotent), but would be a real hazard for NOPing
+        # dead code - never let a "dead" (or unresolved) row claim an
+        # address that a REAL block also claims.
+        real_insn_eas = set()
+        for block in self.visited.values():
+            real_insn_eas.update(block.insn_eas)
+
         blocks = []
         for ea, block in self.visited.items():
             reason = self.decision_summary.get(ea) or ("Trace start" if ea == self.start_ea else "")
@@ -3635,28 +3829,74 @@ class CfgTraceRunner(object):
                 verdict="real", reason=reason,
             ))
         for ea, block in self.dead_blocks.items():
+            safe_eas = [a for a in block.insn_eas if a not in real_insn_eas]
+            if not safe_eas:
+                continue
             blocks.append(CfgTraceBlockRecord(
-                start_ea=block.start_ea, end_ea=block.end_ea, insn_eas=list(block.insn_eas),
+                start_ea=block.start_ea, end_ea=block.end_ea, insn_eas=safe_eas,
                 verdict="dead", reason=self.dead_reason.get(ea, ""),
             ))
         for item in self.unresolved:
             block = item.get("block")
             if block is not None:
+                safe_eas = [a for a in block.insn_eas if a not in real_insn_eas]
+                if not safe_eas:
+                    continue
                 blocks.append(CfgTraceBlockRecord(
-                    start_ea=block.start_ea, end_ea=block.end_ea, insn_eas=list(block.insn_eas),
+                    start_ea=block.start_ea, end_ea=block.end_ea, insn_eas=safe_eas,
                     verdict="unresolved", reason=item.get("note", ""),
                 ))
             else:
                 anchor = item.get("anchor_ea")
-                if anchor is not None:
+                if anchor is not None and anchor not in real_insn_eas:
                     blocks.append(CfgTraceBlockRecord(
                         start_ea=anchor, end_ea=anchor, insn_eas=[anchor],
                         verdict="unresolved", reason=item.get("note", ""),
                     ))
+
+        jump_patches = self._compute_jump_patches()
+
         return CfgTraceResult(
             blocks=blocks, partial=partial, blocks_processed=self.blocks_processed,
             unexplored=unexplored, error=None, symbolic_resolved_count=self.symbolic_resolved_count,
+            jump_patches=jump_patches,
         )
+
+    def _compute_jump_patches(self):
+        """Finds every conditional_branch block whose two successors were
+        BOTH fully decided with OPPOSITE verdicts (one real, one dead) -
+        a fully-resolved binary opaque predicate, the only case eligible
+        for jump patching. Deliberately excludes genuine data-dependent
+        branches (both sides real - nothing to redirect, both are
+        legitimately reachable) and anything touching an unresolved
+        successor (never patch based on an undecided verdict).
+        """
+        patches = []
+        for ea, block in self.visited.items():
+            if block.kind != "conditional_branch" or len(block.successors) != 2:
+                continue
+            jump_succ = next((s for s in block.successors if s.role == "jump_target"), None)
+            fall_succ = next((s for s in block.successors if s.role == "fallthrough"), None)
+            if jump_succ is None or fall_succ is None or jump_succ.ea is None or fall_succ.ea is None:
+                continue
+            jump_is_real = jump_succ.ea in self.visited or jump_succ.ea in self.queued
+            jump_is_dead = jump_succ.ea in self.dead
+            fall_is_real = fall_succ.ea in self.visited or fall_succ.ea in self.queued
+            fall_is_dead = fall_succ.ea in self.dead
+            if jump_is_real and fall_is_dead:
+                patches.append(CfgTraceJumpPatch(
+                    jcc_ea=block.last_insn_ea, real_target_ea=jump_succ.ea,
+                    dead_target_ea=fall_succ.ea, role_of_real="jump_target",
+                ))
+            elif fall_is_real and jump_is_dead:
+                patches.append(CfgTraceJumpPatch(
+                    jcc_ea=block.last_insn_ea, real_target_ea=fall_succ.ea,
+                    dead_target_ea=jump_succ.ea, role_of_real="fallthrough",
+                ))
+            # else: both real (data-dependent), both dead (shouldn't
+            # happen - a live block always has a real predecessor chain),
+            # or one/both unresolved - nothing eligible to patch here.
+        return patches
 
     # -- LLM round-trip for one decision point -------------------------
 
@@ -3697,7 +3937,7 @@ class CfgTraceRunner(object):
                 lines.append("  " + entry)
         lines.append("")
         lines.append("Current block (%#010x - %#010x), kind=%s:" % (block.start_ea, block.end_ea, block.kind))
-        lines.append(block.text)
+        lines.append(render_block_text(block.insn_eas))
         lines.append("")
         lines.append("Candidates:")
         for idx, succ in enumerate(block.successors):
@@ -3956,10 +4196,106 @@ class CfgTraceRunner(object):
 
 _CfgTraceApplyItem = namedtuple("_CfgTraceApplyItem", ["insn_eas", "verdict", "comment"])
 
+_PATCH_MASK64 = 0xFFFFFFFFFFFFFFFF
 
-def _apply_cfg_trace_and_refresh(config, items):
+
+def _compute_jcc_patch_bytes(jcc_ea, size, raw, real_target_ea, role_of_real):
+    """Pure byte-level computation (no IDA calls) - given a decoded Jcc's
+    address/size/raw bytes, the resolved real target, and which side is
+    real, returns the exact `size`-byte replacement to write at jcc_ea,
+    or None if this encoding isn't confidently recognized/supported (the
+    caller must leave the original bytes untouched in that case - never
+    guess at an encoding this hasn't verified).
+    """
+    if len(raw) != size:
+        return None
+    if role_of_real == "fallthrough":
+        # Real path is "don't take the jump" - NOP the whole instruction
+        # so execution always falls through, now unconditionally.
+        return b"\x90" * size
+    if role_of_real != "jump_target":
+        return None
+    if size == 2 and 0x70 <= raw[0] <= 0x7F:
+        # Short Jcc (opcode + rel8) -> short JMP (0xEB + SAME rel8) -
+        # identical length, identical displacement byte (the target is
+        # unchanged - we're only making the existing jump unconditional),
+        # opcode swap only.
+        rel8 = raw[1] if raw[1] < 0x80 else raw[1] - 0x100
+        if (jcc_ea + 2 + rel8) & _PATCH_MASK64 != real_target_ea & _PATCH_MASK64:
+            return None  # inconsistent with the claimed target - refuse rather than guess
+        return bytes([0xEB, raw[1]])
+    if size == 6 and raw[0] == 0x0F and 0x80 <= raw[1] <= 0x8F:
+        # Near Jcc (0F 8x + rel32, 6 bytes) -> near JMP (E9 + rel32, 5
+        # bytes) - one byte SHORTER, so the displacement must be
+        # recomputed from scratch (JMP's rel32 is relative to a
+        # different reference point) and the spare byte NOPed to keep
+        # every later instruction's address unchanged.
+        new_rel32 = (real_target_ea - (jcc_ea + 5)) & 0xFFFFFFFF
+        signed_new_rel32 = new_rel32 if new_rel32 < 0x80000000 else new_rel32 - 0x100000000
+        if (jcc_ea + 5 + signed_new_rel32) & _PATCH_MASK64 != real_target_ea & _PATCH_MASK64:
+            return None
+        return bytes([0xE9]) + new_rel32.to_bytes(4, "little") + b"\x90"
+    return None
+
+
+def _patch_bytes_and_reanalyze(ea, new_bytes):
+    for i, b in enumerate(new_bytes):
+        ida_bytes.patch_byte(ea + i, b)
+    try:
+        ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, len(new_bytes))
+    except Exception:
+        pass
+    try:
+        ida_auto.plan_and_wait(ea, ea + len(new_bytes))
+    except Exception:
+        pass
+
+
+def _patch_nop_instruction(ea):
+    """Decodes the instruction currently at ea (fresh, so this reflects
+    whatever is really there right now) and overwrites every one of its
+    bytes with NOP (0x90) - safe for any instruction length since NOP is
+    a valid single-byte filler, no multi-byte NOP encoding needed.
+    """
+    probe = ida_ua.insn_t()
+    size = ida_ua.decode_insn(probe, ea)
+    if size <= 0:
+        size = 1  # could not decode - NOP at least the one byte we know about
+    _patch_bytes_and_reanalyze(ea, b"\x90" * size)
+
+
+def _patch_jcc_to_real_target(jcc_ea, real_target_ea, role_of_real):
+    """Returns (ok, reason_or_None). Re-decodes the instruction at jcc_ea
+    fresh (never trusts stale data) and verifies its raw bytes match one
+    of exactly two recognized x86 Jcc encodings before touching anything -
+    see _compute_jcc_patch_bytes. Any other encoding (jcxz, unusual
+    prefixes, anything this hasn't specifically verified) is refused,
+    not guessed at.
+    """
+    insn = ida_ua.insn_t()
+    size = ida_ua.decode_insn(insn, jcc_ea)
+    if size <= 0:
+        return False, "could not decode instruction at %#010x" % jcc_ea
+    try:
+        raw = ida_bytes.get_bytes(jcc_ea, size)
+    except Exception as exc:
+        return False, "could not read instruction bytes: %s" % exc
+    if raw is None or len(raw) != size:
+        return False, "could not read instruction bytes at %#010x" % jcc_ea
+    patch = _compute_jcc_patch_bytes(jcc_ea, size, raw, real_target_ea, role_of_real)
+    if patch is None:
+        return False, "unrecognized or inconsistent Jcc encoding at %#010x (size=%d) - not patched" % (jcc_ea, size)
+    _patch_bytes_and_reanalyze(jcc_ea, patch)
+    return True, None
+
+
+def _apply_cfg_trace_and_refresh(config, items, jump_patches=None):
     """One execute_sync/MFF_WRITE round-trip for the whole accepted set.
-    Mark/comment only, per the confirmed v1 scope - no byte patching.
+    Always marks/comments (color + comment only, per the confirmed v1
+    scope). If jump_patches is given (only when the user explicitly
+    opted in via "Also patch bytes"), ALSO NOPs every checked dead
+    instruction's bytes and redirects each listed conditional jump to
+    its real target - see _patch_nop_instruction/_patch_jcc_to_real_target.
     Colors are idc.set_color's native 0xBBGGRR (BGR, not RGB) packed ints;
     applied across every instruction in the block's range so the whole
     marked region is visually distinct, while the comment itself is only
@@ -3980,6 +4316,30 @@ def _apply_cfg_trace_and_refresh(config, items):
                     idc.set_cmt(ea, item.comment, 0)
             except Exception:
                 pass
+
+    patch_log = []
+    if jump_patches:
+        dead_insn_eas = set()
+        for item in items:
+            if item.verdict == "dead":
+                dead_insn_eas.update(item.insn_eas)
+        for ea in sorted(dead_insn_eas):
+            try:
+                _patch_nop_instruction(ea)
+            except Exception as exc:
+                patch_log.append("Failed to NOP dead instruction at %#010x: %s" % (ea, exc))
+        for jp in jump_patches:
+            try:
+                ok, reason = _patch_jcc_to_real_target(jp.jcc_ea, jp.real_target_ea, jp.role_of_real)
+                if not ok:
+                    patch_log.append("Failed to patch jump at %#010x: %s" % (jp.jcc_ea, reason))
+            except Exception as exc:
+                patch_log.append("Failed to patch jump at %#010x: %s" % (jp.jcc_ea, exc))
+    if patch_log:
+        ida_kernwin.msg(
+            "".join("[%s] %s\n" % (PLUGIN_NAME, line) for line in patch_log)
+        )
+
     try:
         ida_kernwin.request_refresh(ida_kernwin.IWID_DISASM)
     except Exception:
@@ -3988,6 +4348,80 @@ def _apply_cfg_trace_and_refresh(config, items):
         except Exception:
             pass
     return 1
+
+
+class CfgTraceGraphView(ida_graph.GraphViewer):
+    """Live, native IDA graph view of a CfgTraceRunner's progress -
+    read-only observer over the runner's already-public state
+    (visited/dead_blocks/unresolved), redrawn on demand via Refresh()
+    from CfgTraceDialog's existing (already-throttled) log/status
+    callbacks - no changes to CfgTraceRunner itself needed. Reuses the
+    same cfg_trace_color_real/dead/unresolved config values as the final
+    disassembly marking, so the graph and the marked disassembly agree
+    visually. Double-click a node to jump the disassembly view there.
+    """
+
+    def __init__(self, config, runner, title):
+        self.config = config
+        self.runner = runner
+        ida_graph.GraphViewer.__init__(self, title, close_open=True)
+
+    def OnRefresh(self):
+        self.Clear()
+        node_by_ea = {}
+
+        def add_node(ea, block, verdict, color):
+            if ea in node_by_ea:
+                return node_by_ea[ea]
+            kind = block.kind if block is not None else "?"
+            label = "%#010x\n%s (%s)" % (ea, verdict, kind)
+            nid = self.AddNode((label, color, ea))
+            node_by_ea[ea] = nid
+            return nid
+
+        for ea, block in self.runner.visited.items():
+            add_node(ea, block, "REAL", self.config.cfg_trace_color_real)
+        for ea, block in self.runner.dead_blocks.items():
+            add_node(ea, block, "DEAD", self.config.cfg_trace_color_dead)
+        for item in self.runner.unresolved:
+            ea = item.get("ea")
+            if ea is None:
+                ea = item.get("anchor_ea")
+            if ea is None:
+                continue
+            add_node(ea, item.get("block"), "UNRESOLVED", self.config.cfg_trace_color_unresolved)
+
+        for ea, block in self.runner.visited.items():
+            for succ in block.successors:
+                if succ.ea is not None and succ.ea in node_by_ea:
+                    self.AddEdge(node_by_ea[ea], node_by_ea[succ.ea])
+        for ea, block in self.runner.dead_blocks.items():
+            for succ in block.successors:
+                if succ.ea is not None and succ.ea in node_by_ea:
+                    self.AddEdge(node_by_ea[ea], node_by_ea[succ.ea])
+        return True
+
+    def OnGetText(self, node_id):
+        label, color, _ea = self[node_id]
+        return (label, color)
+
+    def OnHint(self, node_id):
+        _label, _color, ea = self[node_id]
+        block = self.runner.visited.get(ea) or self.runner.dead_blocks.get(ea)
+        if block is not None and block.insn_eas:
+            try:
+                return render_block_text(block.insn_eas)
+            except Exception:
+                pass
+        return "%#010x" % ea
+
+    def OnDblClick(self, node_id):
+        _label, _color, ea = self[node_id]
+        try:
+            ida_kernwin.jumpto(ea)
+        except Exception:
+            pass
+        return True
 
 
 class CfgTraceDialog(QtWidgets.QDialog):
@@ -4008,7 +4442,9 @@ class CfgTraceDialog(QtWidgets.QDialog):
         self.start_ea = start_ea
         self.runner = None
         self.result = None
+        self.graph_view = None
         self._log_lines_since_pump = 0
+        self._last_graph_refresh_ts = 0.0
 
         self.setWindowTitle("%s - Trace/Recover CFG" % PLUGIN_NAME)
         self.resize(760, 560)
@@ -4047,6 +4483,15 @@ class CfgTraceDialog(QtWidgets.QDialog):
         self.addr_edit = QtWidgets.QLineEdit("%#010x" % self.start_ea)
         form.addRow("Start address:", self.addr_edit)
         layout.addLayout(form)
+
+        self.show_graph_check = QtWidgets.QCheckBox("Show live CFG graph while tracing")
+        self.show_graph_check.setChecked(True)
+        self.show_graph_check.setToolTip(
+            "Opens a native IDA graph view, colored the same as the final disassembly "
+            "marking (green/red/amber), that fills in live as the trace progresses. "
+            "Double-click a node to jump the disassembly view there."
+        )
+        layout.addWidget(self.show_graph_check)
 
         self.confirm_status_label = QtWidgets.QLabel("")
         palette = self.confirm_status_label.palette()
@@ -4102,6 +4547,9 @@ class CfgTraceDialog(QtWidgets.QDialog):
         self.log_edit.setFont(QtGui.QFont("Consolas", 9))
         layout.addWidget(self.log_edit, 1)
         button_row = QtWidgets.QHBoxLayout()
+        self.show_graph_button = QtWidgets.QPushButton("Show Graph")
+        self.show_graph_button.clicked.connect(self._ensure_graph_view)
+        button_row.addWidget(self.show_graph_button)
         button_row.addStretch(1)
         self.running_cancel_button = QtWidgets.QPushButton("Cancel")
         self.running_cancel_button.clicked.connect(self._on_cancel_trace)
@@ -4116,16 +4564,79 @@ class CfgTraceDialog(QtWidgets.QDialog):
         self.runner = CfgTraceRunner(
             self.config, self.start_ea, on_log=self._on_trace_log, on_status=self._on_trace_status,
         )
+        if self.show_graph_check.isChecked():
+            self._ensure_graph_view()
         self.runner.start(self._on_trace_finished)
+
+    def _ensure_graph_view(self):
+        if self.runner is None:
+            return
+        plugin = LLMExplainerPlugin.instance
+        if plugin is None:
+            return
+        if self.graph_view is None:
+            title = "CFG Trace - %#010x" % self.start_ea
+            self.graph_view = plugin.open_cfg_trace_graph(self.runner, title)
+        else:
+            try:
+                self.graph_view.Show()
+            except Exception:
+                self.graph_view = plugin.open_cfg_trace_graph(self.runner, "CFG Trace - %#010x" % self.start_ea)
+        self._refresh_graph_view(force=True)
+
+    def _refresh_graph_view(self, force=False):
+        if self.graph_view is None:
+            return
+        # A graph Refresh() means a full Clear() + rebuild + IDA's own
+        # re-layout of the whole graph - much more expensive than a log
+        # append, so this is throttled by WALL-CLOCK TIME rather than
+        # block count. Must be called on every block (see _on_trace_log)
+        # rather than gated behind a block-count threshold: a trace
+        # short enough to finish before that threshold was ever reached
+        # (very plausible, especially now that the symbolic engine
+        # resolves most branches instantly) would otherwise never
+        # refresh the graph at all until the very end.
+        now = time.monotonic()
+        if not force and (now - self._last_graph_refresh_ts) < 0.5:
+            return
+        self._last_graph_refresh_ts = now
+        try:
+            self.graph_view.Refresh()
+        except Exception:
+            pass
+        # Refresh() only triggers OnRefresh() to rebuild the node/edge
+        # data - it does not force an immediate repaint. During a long
+        # auto-resolve run, _pump() can process many blocks synchronously
+        # inside a single execute_sync(MFF_WRITE) call without ever
+        # yielding back to IDA's own UI loop, so that rebuilt data was
+        # visibly queued but never actually painted until the call
+        # returned - refresh_viewer() is the lower-level "redraw this
+        # widget now" call that Refresh() doesn't itself guarantee, and
+        # processEvents() right after gives IDA's event loop an actual
+        # chance to run that repaint before the tight loop continues.
+        try:
+            gv = self.graph_view.GetWidgetAsGraphViewer()
+            if gv is not None:
+                ida_graph.refresh_viewer(gv)
+        except Exception:
+            pass
+        try:
+            QtWidgets.QApplication.processEvents()
+        except Exception:
+            pass
 
     def _on_trace_log(self, text):
         try:
             self.log_edit.appendPlainText(text)
         except RuntimeError:
             return
+        # Self-throttled internally (see above) - safe/cheap to call on
+        # every block rather than gating it behind a block count.
+        self._refresh_graph_view()
         # Even a long silent auto-resolve chain (zero LLM calls) should keep
         # the log visibly growing and Cancel responsive, not freeze the UI
-        # until the next network round-trip.
+        # until the next network round-trip - kept as a coarser fallback
+        # pump independent of whether a graph view is even open.
         self._log_lines_since_pump += 1
         if self._log_lines_since_pump >= 20:
             self._log_lines_since_pump = 0
@@ -4144,6 +4655,7 @@ class CfgTraceDialog(QtWidgets.QDialog):
 
     def _on_trace_finished(self, result):
         self.result = result
+        self._refresh_graph_view(force=True)
         self._populate_review(result)
         self.stack.setCurrentIndex(2)
 
@@ -4161,7 +4673,27 @@ class CfgTraceDialog(QtWidgets.QDialog):
         self.review_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.review_table, 1)
 
+        self.patch_bytes_check = QtWidgets.QCheckBox(
+            "Also patch bytes (redirect confirmed opaque-predicate jumps to their real "
+            "target, NOP dead code)"
+        )
+        self.patch_bytes_check.setChecked(False)
+        self.patch_bytes_check.setToolTip(
+            "Unlike the color/comment marking above, this changes actual code bytes, not "
+            "just IDB metadata (though it is revertible via Edit > Patches). Only applies "
+            "to conditional_branch blocks where BOTH successors were fully and oppositely "
+            "decided (one real, one dead) AND both corresponding rows are checked above - "
+            "never to genuine data-dependent branches (both sides real) or anything "
+            "touching an unresolved verdict. You will be asked to confirm the exact count "
+            "before anything is patched."
+        )
+        self.patch_bytes_check.toggled.connect(self._on_patch_bytes_toggled)
+        layout.addWidget(self.patch_bytes_check)
+
         button_row = QtWidgets.QHBoxLayout()
+        self.review_show_graph_button = QtWidgets.QPushButton("Show Graph")
+        self.review_show_graph_button.clicked.connect(self._ensure_graph_view)
+        button_row.addWidget(self.review_show_graph_button)
         button_row.addStretch(1)
         self.accept_button = QtWidgets.QPushButton("Accept && Mark Disassembly")
         self.accept_button.clicked.connect(self._on_accept)
@@ -4172,6 +4704,11 @@ class CfgTraceDialog(QtWidgets.QDialog):
         layout.addLayout(button_row)
 
         self.stack.addWidget(page)
+
+    def _on_patch_bytes_toggled(self, checked):
+        self.accept_button.setText(
+            "Accept && Mark/Patch Disassembly" if checked else "Accept && Mark Disassembly"
+        )
 
     def _populate_review(self, result):
         status = "Partial (block cap reached)" if result.partial else "Complete"
@@ -4217,17 +4754,45 @@ class CfgTraceDialog(QtWidgets.QDialog):
 
     def _on_accept(self):
         items = []
+        checked_by_addr_verdict = set()
         for i, rec in enumerate(self._review_rows):
             if self.review_table.item(i, self.COL_APPLY).checkState() != QtCore.Qt.CheckState.Checked:
                 continue
             items.append(_CfgTraceApplyItem(
                 insn_eas=rec.insn_eas, verdict=rec.verdict, comment=self._build_comment(rec),
             ))
+            checked_by_addr_verdict.add((rec.start_ea, rec.verdict))
         if not items:
             self.close()
             return
+
+        jump_patches = None
+        if self.patch_bytes_check.isChecked():
+            # Only ever patch a jump when BOTH of its successors' rows are
+            # checked - if the user unchecked either side, treat that jcc
+            # as "not confirmed enough to touch bytes for", same as if
+            # patching were off entirely for that one.
+            all_patches = self.result.jump_patches if self.result is not None else []
+            jump_patches = [
+                jp for jp in all_patches
+                if (jp.real_target_ea, "real") in checked_by_addr_verdict
+                and (jp.dead_target_ea, "dead") in checked_by_addr_verdict
+            ]
+            dead_n = sum(1 for it in items if it.verdict == "dead")
+            answer = QtWidgets.QMessageBox.question(
+                self, "Patch Bytes - %s" % PLUGIN_NAME,
+                "This will modify the loaded binary image, not just IDB colors/comments:\n\n"
+                "  - NOP out %d dead instruction address(es)\n"
+                "  - Redirect %d conditional jump(s) to their confirmed real target\n\n"
+                "This is revertible via Edit > Patches > ... in IDA if needed. Continue?"
+                % (dead_n, len(jump_patches)),
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+
         ida_kernwin.execute_sync(
-            functools.partial(_apply_cfg_trace_and_refresh, self.config, items), ida_kernwin.MFF_WRITE
+            functools.partial(_apply_cfg_trace_and_refresh, self.config, items, jump_patches),
+            ida_kernwin.MFF_WRITE,
         )
         self.accept_button.setEnabled(False)
         self.close()
@@ -4373,8 +4938,10 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         "batch-explain multiple functions. In the disassembly view, "
         "'Trace/Recover CFG...' asks the LLM to walk an obfuscated "
         "function's real control flow branch by branch and mark real/dead "
-        "code (color + comment only, no byte patching). Edit > Plugins > "
-        "LLM Explainer opens settings."
+        "code (color + comment by default; an opt-in 'Also patch bytes' "
+        "option can additionally NOP dead code and redirect confirmed "
+        "opaque-predicate jumps). Edit > Plugins > LLM Explainer opens "
+        "settings."
     )
     wanted_name = PLUGIN_NAME
     wanted_hotkey = ""
@@ -4385,6 +4952,7 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         LLMExplainerPlugin.instance = self
         self.config = PluginConfig.load()
         self._open_dialogs = []
+        self._open_graphs = []
         self._action_handler = ExplainActionHandler()
         self._recursive_action_handler = ExplainRecursiveActionHandler()
         self._batch_action_handler = BatchActionHandler()
@@ -4487,6 +5055,12 @@ class LLMExplainerPlugin(idaapi.plugin_t):
             except Exception:
                 pass
         self._open_dialogs = []
+        for graph in list(self._open_graphs):
+            try:
+                graph.Close()
+            except Exception:
+                pass
+        self._open_graphs = []
         try:
             self._popup_hooks.unhook()
         except Exception:
@@ -4534,6 +5108,15 @@ class LLMExplainerPlugin(idaapi.plugin_t):
     def open_cfg_trace_dialog(self, start_ea):
         dlg = CfgTraceDialog(self.config, start_ea)
         return self._track_dialog(dlg)
+
+    def open_cfg_trace_graph(self, runner, title):
+        """Kept alive independently of whichever CfgTraceDialog created
+        it (a plain Python reference must stay live for as long as the
+        native graph widget is open), and closed on plugin term()."""
+        graph = CfgTraceGraphView(self.config, runner, title)
+        self._open_graphs.append(graph)
+        graph.Show()
+        return graph
 
     def open_recursive_explain(self, func):
         """Target function plus its direct callees only (depth 1 - callees

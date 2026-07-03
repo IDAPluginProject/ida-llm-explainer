@@ -67,10 +67,25 @@ checkbox, editable before anything is written.
   got wrong (undefine + recreate, never touching a byte — the same fixup you'd do by hand with
   U then C), since obfuscated code routinely has real jump targets landing mid-instruction
   relative to IDA's initial linear-sweep guess; this happens immediately, not deferred to
-  Accept. A live, cancellable transcript shows progress; once the trace finishes (or a
-  configurable block-count safety cap is hit), a review table lets you check/uncheck each
-  decided block before Accept. The REAL/DEAD/UNRESOLVED verdicts themselves only color the
-  disassembly and add a comment — no byte patching, NOPing, or branch rewriting.
+  Accept. A live, cancellable transcript shows progress, alongside an optional live graph view
+  (a native IDA graph, colored the same green/red/amber as the eventual disassembly marking,
+  filling in node by node as the trace runs — double-click a node to jump there); once the
+  trace finishes (or a configurable block-count safety cap is hit), a review table lets you
+  check/uncheck each decided block before Accept. By default Accept only colors the disassembly
+  and adds a comment — no byte patching. An opt-in **"Also patch bytes"** checkbox on the review
+  screen (unchecked by default, with a confirmation prompt) additionally NOPs out confirmed dead
+  code and redirects confirmed opaque-predicate jumps straight to their real target, so Hex-Rays
+  can decompile the recovered function cleanly — see [below](#patching-the-recovered-cfg) for
+  exactly what it does and does not touch.
+
+![Trace/Recover CFG live view: the recovered control-flow graph, colored real/dead, next to the live transcript explaining each block's verdict](tracer.png)
+
+The screenshot above shows a real trace against an obfuscated function: the live graph fills in
+as each block is decided (green = real path, red = decoy), while the transcript streams the
+model's reasoning behind every REAL/DEAD verdict — here, opaque predicates built on flag tricks
+(`xor dl, 0` clearing the overflow flag, `xchg ax, ax` fixing the parity flag) that fall outside
+what the constant-propagation pass models on its own, so the LLM works them out directly from
+the flag semantics instead.
 
 ## Requirements
 
@@ -160,7 +175,9 @@ mode writes to the database unattended.
 
 1. In the **disassembly view**, put the cursor on the function's entry point (or any address
    you want to start from) and right-click → **LLM Explainer → Trace/Recover CFG...**.
-2. Confirm or edit the start address, then click **Start**.
+2. Confirm or edit the start address, optionally leave "Show live CFG graph while tracing"
+   checked (a native IDA graph view opens alongside, filling in as blocks are decided — use
+   **Show Graph** at any point later to reopen it if closed), then click **Start**.
 3. Watch the live transcript as it walks basic blocks, auto-continuing through single-successor
    blocks and, at each real branch/indirect jump, first trying to resolve it automatically via
    constant propagation before ever pausing for an LLM round-trip. As it walks it also fixes up
@@ -173,7 +190,33 @@ mode writes to the database unattended.
    result), review the table of every decided/flagged block — verdict REAL/DEAD/UNRESOLVED, with
    a reason (rows resolved automatically are prefixed `[symbolic]`) — check/uncheck rows, and
    click **Accept & Mark Disassembly**. This only colors the affected instructions and adds a
-   one-line comment on each block's first instruction; it never patches bytes.
+   one-line comment on each block's first instruction; it never patches bytes, unless you've
+   checked "Also patch bytes" (see below).
+
+### Patching the recovered CFG
+
+The review screen also has an **"Also patch bytes"** checkbox (unchecked by default, with a
+confirmation prompt showing exact counts before anything is touched). When checked, **Accept**
+additionally:
+
+- **NOPs out every checked DEAD instruction's bytes** (`0x90` per byte — safe for any
+  instruction length, no multi-byte NOP encoding needed).
+- **Redirects every fully-resolved opaque predicate to its real target** — only for a
+  `conditional_branch` block whose two successors were decided with *opposite* verdicts (one
+  real, one dead) *and* both corresponding rows are checked. A short `Jcc` becomes a short `JMP`
+  to the same target (2 bytes either way, opcode swap only); a near `Jcc` becomes a near `JMP`
+  (one byte shorter, padded with a trailing NOP) with a freshly-computed displacement — never
+  reused/guessed from the original bytes. Genuine data-dependent branches (both sides real) are
+  never touched, since there's nothing to redirect — both paths are legitimately reachable.
+
+Both operations re-decode and verify the actual bytes at each address immediately before
+patching (never trust stale/cached data), and refuse to patch — logging why, leaving the
+original bytes untouched — for anything they don't fully recognize: an unusual `Jcc` encoding,
+a claimed target that doesn't match what the instruction actually encodes, or a dead-code
+address that (per IDA's "overlapping blocks" edge case — see the code comments) might also be
+claimed by a real, live instruction. This changes actual code bytes, not just IDB
+colors/comments — it's revertible via IDA's own **Edit → Patches** menu, but review the counts
+in the confirmation prompt before proceeding.
 
 Blocks the model never gave a verdict for, addresses it invented outside the actual candidates,
 and conflicting REAL/DEAD verdicts for the same address reached from different paths are all
@@ -184,12 +227,16 @@ or a value it can positively attribute to runtime/caller data) — anything it i
 still falls back to the LLM rather than guessing.
 
 **Constant-propagation pass limitations** (falls back to the LLM for these, same as if the
-feature were off): x86/x64 only; no indexed/scaled memory addressing (`[rcx+rdx*4]` — only
-simple `[reg+disp]`); state isn't tracked across `call` instructions (a full, conservative
-reset); only `mov`/`movzx`/`movsx(d)`/`lea`/`add`/`sub`/`and`/`or`/`xor`/`not`/`neg`/`inc`/`dec`/
-`shl`/`shr`/`sar`/`cmp`/`test`/`push`/`pop`/`nop` are modeled — anything else resets tracking for
-that path. Disable "Resolve CFG trace branches via constant propagation" in Settings to force
-every decision point through the LLM as before.
+feature were off): x86/x64 only; indexed/scaled memory addressing (`[rcx+rdx*4]`,
+`[rax*8+table]`) is supported for reads but never round-trip-tracked through writes; a `call`'s
+effect on registers/memory isn't tracked precisely — its results are treated as genuine
+runtime data (same as an incoming argument), which resolves an ordinary
+`if (helper_call(...))`-shaped branch without an LLM call, but means the pass can't reason
+through a call to derive a fixed value; only
+`mov`/`movzx`/`movsx(d)`/`lea`/`add`/`sub`/`and`/`or`/`xor`/`not`/`neg`/`inc`/`dec`/`shl`/`shr`/
+`sar`/`cmp`/`test`/`push`/`pop`/`nop` are modeled — anything else resets tracking for that path.
+Disable "Resolve CFG trace branches via constant propagation" in Settings to force every
+decision point through the LLM as before.
 
 ## Configuration
 
