@@ -96,20 +96,39 @@ byte), the same "U then C" fixup a human would do manually - since
 obfuscated code routinely has real jump targets landing mid-instruction
 relative to IDA's initial linear-sweep guess; this happens immediately
 as part of walking, not deferred to Accept, since it is just correcting
-IDA's own analysis rather than expressing an LLM opinion. An optional
+IDA's own analysis rather than expressing an LLM opinion. A separate
+overlap check guards this same fixup against a different hazard: a
+target discovered LATER in the trace landing strictly inside an
+instruction a DIFFERENT block already claimed and fixed up earlier in
+this same run (the same bytes decoding differently depending on the
+start offset, another classic obfuscation trick) - naively re-walking
+that address would call IDA's own del_items, which deletes the whole
+item covering any address passed to it, silently destroying the earlier
+block's already-established boundary even if that block was already
+confirmed real. Every instruction address claimed so far in the trace is
+tracked, and a strict-overlap target is refused and flagged for manual
+review instead, never touching those bytes at all. An optional
 live graph view (a native IDA graph, colored to match the eventual
 disassembly marking) fills in as the trace runs, alongside the transcript.
 Once the trace finishes, a review table lets you check/uncheck each
 decided block before Accept, which by default only colors the disassembly
 and adds a comment for the REAL/DEAD/UNRESOLVED verdicts themselves - no
-byte patching. An opt-in "Also patch bytes" checkbox (unchecked by
-default, with a confirmation prompt) additionally NOPs confirmed dead
-code and redirects confirmed opaque-predicate jumps (Jcc -> JMP toward
-the real target, or NOP if the real path is the fallthrough) straight to
-their real target, so the recovered function can be handed to Hex-Rays.
-Every patch is computed from freshly re-decoded, verified bytes right
-before writing and refuses (leaving the original bytes untouched) rather
-than guessing at anything it doesn't fully recognize.
+byte patching (the "Mark only" mode). "Patch in place" additionally NOPs
+confirmed dead code and redirects confirmed opaque-predicate jumps
+(Jcc -> JMP toward the real target, or NOP if the real path is the
+fallthrough) straight to their real target, so the recovered function can
+be handed to Hex-Rays. "Rebuild linear" takes a different approach:
+leaves every original byte untouched except the function's own entry
+point, and writes a freshly concatenated straight-line sequence of just
+the real blocks there instead, with every jump/call re-encoded
+explicitly (never relying on layout adjacency) - a block using RIP-
+relative addressing or a live multi-case dispatch can't be safely moved
+and is left at its original address, refusing the whole rebuild rather
+than guessing if that address (or a relocated block's reference to it)
+would fall inside the newly rebuilt range. Every patch, in either mode,
+is computed from freshly re-decoded, verified bytes right before writing
+and refuses (leaving the original bytes untouched) rather than guessing
+at anything it doesn't fully recognize.
 """
 
 import functools
@@ -120,7 +139,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections import deque, namedtuple
+from collections import deque, namedtuple, OrderedDict
 
 import idaapi
 import idautils
@@ -153,7 +172,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.2.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -352,7 +371,30 @@ CFG_TRACE_SYSTEM_PROMPT = (
     "one, prefer UNRESOLVED_TARGET over DEAD_TARGET for the affected "
     "candidate(s); only declare a loop-adjacent branch a genuine opaque "
     "predicate when you can see the deciding state is set once before "
-    "the loop and never touched again anywhere reachable from it.\n\n"
+    "the loop and never touched again anywhere reachable from it.\n"
+    "7. REUSED FLAGS ACROSS MULTIPLE CONDITION CODES: a very common trick "
+    "is several Jcc instructions in a row (sometimes separated by "
+    "flag-preserving junk like nop, mov reg,reg with the SAME register, "
+    "or other instructions that do not touch flags) that all actually "
+    "test the SAME earlier comparison/arithmetic result, just with "
+    "DIFFERENT condition codes - not independent tests. Before treating a "
+    "Jcc as its own fresh test, check whether anything between it and the "
+    "previous flag-setting instruction actually modifies flags at all "
+    "(most instructions other than cmp/test/add/sub/and/or/xor/shifts/"
+    "inc/dec/neg do not). If not, work out that earlier result's actual "
+    "sign/zero/value and evaluate the current condition code against THAT "
+    "- do not assume each subsequent branch is an independent, equally "
+    "'genuinely data-dependent' test just because an earlier one in the "
+    "same chain was. It is entirely possible for the first branch in such "
+    "a chain to be genuinely data-dependent (e.g. testing one bit of a "
+    "caller-supplied value) while a LATER branch in the very same chain is "
+    "a fully determined opaque predicate given which side of the first "
+    "branch was taken - e.g. if the first branch only proceeds past it "
+    "when a value ANDed with a single-bit mask was nonzero, that value on "
+    "this path is now KNOWN to equal exactly that mask, not merely "
+    "'some unknown nonzero value' - and a later signed/unsigned comparison "
+    "against that same (now effectively fixed) result can be a genuine "
+    "opaque predicate even though the original bit test was not.\n\n"
     "Reply using exactly one line per candidate, in one of these three "
     "forms:\n"
     "REAL_TARGET: <address> - <short reason>\n"
@@ -915,7 +957,9 @@ BlockSuccessor = namedtuple("BlockSuccessor", ["ea", "role", "case_values", "not
 
 # kind: "return" | "unconditional_jump" | "conditional_branch" |
 # "indirect_jump" | "undecodable" | "truncated" (hit the internal
-# max_instrs safety valve without reaching a block-ending instruction).
+# max_instrs safety valve without reaching a block-ending instruction) |
+# "overlap" (walked into the middle of an instruction some OTHER block in
+# this trace already claimed - see _find_overlapping_claim).
 BlockInfo = namedtuple(
     "BlockInfo",
     ["start_ea", "end_ea", "text", "kind", "successors", "last_insn_ea", "insn_eas", "sym_insns"],
@@ -925,6 +969,26 @@ BlockInfo = namedtuple(
 # turning into a runaway loop. Not user-configurable - hitting it always
 # means "something is wrong here", not "this is a big block".
 _MAX_BLOCK_INSTRS = 300
+
+# Architectural max x86/x64 instruction length - used by
+# _find_overlapping_claim below to bound how far back it needs to look.
+_MAX_X86_INSN_LEN = 15
+
+
+def _find_overlapping_claim(ea, claimed_insns):
+    """Returns (claim_start, claim_size) if ea falls STRICTLY inside an
+    instruction some OTHER block in this same trace already claimed and
+    fixed up in the database (claim_start != ea - an exact match at the
+    same start address is a normal, safe merge point, not an overlap).
+    x86/x64 instructions are at most 15 bytes, so checking that many
+    preceding addresses is sufficient to catch any possible overlap.
+    """
+    for back in range(1, _MAX_X86_INSN_LEN):
+        candidate = ea - back
+        size = claimed_insns.get(candidate)
+        if size is not None and candidate + size > ea:
+            return candidate, size
+    return None, None
 
 
 def _fixup_instruction_boundary(ea, expected_size):
@@ -1050,6 +1114,16 @@ def _sym_to_signed(val, width):
     return val
 
 
+def _sym_parity_even(val):
+    """PF reflects the parity of only the LOW BYTE of the result,
+    regardless of the operand's actual width (x86 architectural rule -
+    unlike ZF/SF/etc., which use the full result). Always derivable from
+    a concrete value alone, the same way ZF/SF already are - no flag
+    guarantee needed, see _sym_zero_based's jp/jpe/jnp/jpo entries.
+    """
+    return bin(val & 0xFF).count("1") % 2 == 0
+
+
 class SymState(object):
     """A snapshot of what the trace concretely knows about registers and
     a bounded set of base+displacement memory slots at one point in the
@@ -1065,7 +1139,32 @@ class SymState(object):
         self.regs = {}          # family -> int | EXTERNAL
         self.mem = {}           # (base_family, raw_disp) -> (int|EXTERNAL, width)
         self.last_cmp = None    # (left, right, width) from cmp/sub - left/right may be EXTERNAL
-        self.last_flags = None  # (value, width) from test/and/or/xor/other arith result
+        self.last_flags = None  # (value, width, cf_zero, of_zero, refine_info) from test/
+                                 # and/or/xor/other arith result. cf_zero/of_zero are True
+                                 # only when THAT SPECIFIC flag is architecturally
+                                 # guaranteed zero right now - and/or/xor/test guarantee
+                                 # BOTH (Intel SDM: "the OF and CF flags are cleared"),
+                                 # letting _sym_cmp_based's zero_fallback resolve ja/jae/jb/
+                                 # jbe (need cf_zero) and jg/jge/jl/jle (need of_zero) from a
+                                 # single result value the same way _sym_zero_based already
+                                 # does for jz/jnz/js/jns. add/sub/neg/shifts get neither
+                                 # (their CF/OF genuinely depend on the operands). inc/dec
+                                 # are the one case that's split: real x86 does NOT touch CF
+                                 # for inc/dec at all (a well-known quirk - only SF/ZF/OF/AF/
+                                 # PF change), so their handler explicitly CARRIES FORWARD
+                                 # whatever cf_zero already was rather than clearing it, while
+                                 # still setting of_zero=False (inc/dec's OF genuinely can be
+                                 # set, at the signed range boundary).
+                                 # refine_info is (family, mask) only when this came from
+                                 # `and reg, single_bit_mask` on a genuinely EXTERNAL reg -
+                                 # see _compute_and_mask_refinement: even though the value
+                                 # itself is unknown, AND-with-one-bit can only ever produce
+                                 # exactly 0 or exactly that mask, so once a zero/nonzero
+                                 # test resolves which side of a branch we're on, THAT
+                                 # register is provably exactly one of those two concrete
+                                 # values on that specific edge - letting anything further
+                                 # down that one path resolve precisely instead of forever
+                                 # treating the register as merely "some unknown value".
 
     def copy(self):
         s = SymState()
@@ -1256,6 +1355,10 @@ def _sym_h_lea(state, ops):
     _sym_write_dest(state, dst, None)
 
 
+def _sym_is_single_bit_mask(value):
+    return isinstance(value, int) and value != 0 and (value & (value - 1)) == 0
+
+
 def _sym_make_alu2(op_name):
     def handler(state, ops):
         dst, src = ops[0], ops[1]
@@ -1270,7 +1373,20 @@ def _sym_make_alu2(op_name):
             return
         if combo == "external":
             _sym_write_dest(state, dst, EXTERNAL)
-            state.last_flags = (EXTERNAL, dst.width)
+            refine_info = None
+            if (
+                op_name == "and" and left is EXTERNAL and dst.kind == "reg"
+                and src.kind == "imm" and _sym_is_single_bit_mask(src.value)
+            ):
+                # AND with exactly one bit set can only ever produce 0 or
+                # that exact mask - even though the operand itself is
+                # unknown, whichever side of a zero/nonzero test we end
+                # up on afterward pins this register to one of those two
+                # concrete values on that specific path (see
+                # _compute_and_mask_refinement).
+                refine_info = (dst.family, src.value)
+            is_logical = op_name in ("and", "or", "xor")
+            state.last_flags = (EXTERNAL, dst.width, is_logical, is_logical, refine_info)
             if op_name == "sub":
                 state.last_cmp = (left, right, dst.width)
             return
@@ -1289,7 +1405,14 @@ def _sym_make_alu2(op_name):
         else:
             raise AssertionError(op_name)
         _sym_write_dest(state, dst, result)
-        state.last_flags = (result, width)
+        # and/or/xor architecturally guarantee OF=CF=0 (Intel SDM: "the OF
+        # and CF flags are cleared") - add/sub's OF/CF genuinely depend on
+        # the operands, so they don't get that guarantee here. No
+        # refine_info here - the result is already concrete, nothing to
+        # refine (the existing concrete-value handling already resolves
+        # this precisely without needing per-edge narrowing).
+        is_logical = op_name in ("and", "or", "xor")
+        state.last_flags = (result, width, is_logical, is_logical, None)
     return handler
 
 
@@ -1309,9 +1432,9 @@ def _sym_h_test(state, ops):
     if combo == "unsupported":
         state.last_flags = None
     elif combo == "external":
-        state.last_flags = (EXTERNAL, dst.width)
+        state.last_flags = (EXTERNAL, dst.width, True, True, None)  # TEST also guarantees OF=CF=0
     else:
-        state.last_flags = (left & right, dst.width)
+        state.last_flags = (left & right, dst.width, True, True, None)
 
 
 def _sym_make_unary(op_name):
@@ -1323,10 +1446,25 @@ def _sym_make_unary(op_name):
             if op_name != "not":
                 state.last_flags = None
             return
+        # inc/dec do NOT touch CF at all on real x86 (a well-known quirk -
+        # only SF/ZF/OF/AF/PF change) - carry forward whatever cf_zero
+        # already was instead of clearing it, so a CF-only condition
+        # (jae/jb and aliases) reached through an inc/dec right after an
+        # and/or/xor/test that established CF=0 still resolves, rather
+        # than losing that fact the moment an inc/dec runs. neg's CF
+        # genuinely depends on the operand (CF = the operand was
+        # nonzero, not a fixed guarantee), so it does NOT get this.
+        preserved_cf_zero = False
+        if op_name in ("inc", "dec") and state.last_flags is not None:
+            preserved_cf_zero = state.last_flags[2]
         if val is EXTERNAL:
             _sym_write_dest(state, dst, EXTERNAL)
             if op_name != "not":
-                state.last_flags = (EXTERNAL, dst.width)
+                # OF is NOT guaranteed zero for any of these (neg's OF can
+                # be set negating INT_MIN; inc/dec's OF can be set at the
+                # signed range boundary) - never treat these as eligible
+                # for the of_zero-gated zero_fallback and/or/xor/test get.
+                state.last_flags = (EXTERNAL, dst.width, preserved_cf_zero, False, None)
             return
         width = dst.width
         if op_name == "not":
@@ -1341,24 +1479,55 @@ def _sym_make_unary(op_name):
         else:
             raise AssertionError(op_name)
         _sym_write_dest(state, dst, result)
-        state.last_flags = (result, width)
+        state.last_flags = (result, width, preserved_cf_zero, False, None)
     return handler
+
+
+_SYM_SHIFT_COUNT_MASK = {1: 0x1F, 2: 0x1F, 4: 0x1F, 8: 0x3F}
 
 
 def _sym_make_shift(op_name):
     def handler(state, ops):
         dst, src = ops[0], ops[1]
+        if src.kind == "imm" and (src.value & _SYM_SHIFT_COUNT_MASK[dst.width]) == 0:
+            # Real x86 masks the shift count BEFORE using it - to 5 bits
+            # for an 8/16/32-bit operand, 6 bits only for a 64-bit one
+            # (Intel SDM) - so e.g. `shl eax, 32` is masked to a count of
+            # 0 and is a genuine no-op, not "shift by 32". Using a flat
+            # 0x3F mask regardless of width (this function's own earlier,
+            # narrower fix) would miss that for anything narrower than
+            # 64 bits. A masked count of 0 leaves EVERY flag untouched
+            # (Intel SDM: "If the count is 0, the flags are not
+            # affected") and the value is trivially unchanged - a
+            # complete no-op, checked BEFORE resolving the shifted
+            # operand at all. This must come first: an obfuscator
+            # inserting a "shift by 0" (or an equivalent masked-to-0
+            # count) to break naive flag tracking (the exact pattern
+            # this was found against: `or al, 0` then `sal al, 0` before
+            # a jnb/jns pair) commonly does so right after a partial-
+            # register write that already conservatively tainted the
+            # whole operand to fully-unsupported/None (see
+            # _sym_write_dest's width-not-in-(4,8) case) - checking this
+            # after resolving val would see that taint and wipe the
+            # PRECEDING instruction's real flags anyway, exactly the bug
+            # this exists to prevent.
+            return
         val = _sym_resolve_operand(state, dst)
         if src.kind != "imm" or val is None:
             _sym_write_dest(state, dst, None)
             state.last_flags = None
             return
+        count = src.value & _SYM_SHIFT_COUNT_MASK[dst.width]
         if val is EXTERNAL:
             _sym_write_dest(state, dst, EXTERNAL)
-            state.last_flags = (EXTERNAL, dst.width)
+            # Shift flags (esp. OF/CF) have enough count/architecture-
+            # specific edge cases that this never claims OF=CF=0. Unlike
+            # inc/dec, a shift by a NONZERO count genuinely does modify
+            # CF (count==0 is the true no-op, already handled above by
+            # returning before this point) - no carry-forward here.
+            state.last_flags = (EXTERNAL, dst.width, False, False, None)
             return
         width = dst.width
-        count = src.value & 0x3F
         if op_name == "shl":
             result = (val << count) & _SYM_WIDTH_MASK[width]
         elif op_name == "shr":
@@ -1368,7 +1537,7 @@ def _sym_make_shift(op_name):
         else:
             raise AssertionError(op_name)
         _sym_write_dest(state, dst, result)
-        state.last_flags = (result, width)
+        state.last_flags = (result, width, False, False, None)
     return handler
 
 
@@ -1492,14 +1661,53 @@ def sym_run_block(state, sym_insns, rsp_family):
 # every candidate should be marked REAL, not resolved one way or picked
 # arbitrarily.
 
-def _sym_cmp_based(fn):
+def _sym_cmp_based(fn, zero_fallback=None, needs=None, value_independent=False):
+    """fn(left, right, width) evaluates from an explicit two-operand
+    comparison (state.last_cmp, from cmp/sub) - pass None to never
+    attempt this path at all (used for jo/jno: computing signed overflow
+    from two arbitrary operands correctly is its own, riskier problem
+    this deliberately does not take on; only the of_zero guarantee below
+    is trusted). zero_fallback(value, width), when given, additionally
+    lets this resolve from state.last_flags - needs picks which guarantee
+    is required there: "cf" for ja/jae/jb/jbe (and aliases), "of" for
+    jg/jge/jl/jle and jo/jno. and/or/xor/test guarantee BOTH cf_zero and
+    of_zero simultaneously (Intel SDM: "the OF and CF flags are
+    cleared"); inc/dec carry forward cf_zero alone (real x86 never
+    touches CF for inc/dec, but DOES change OF) - see the
+    SymState.last_flags docstring. Without this fallback (fn/
+    zero_fallback omitted for anything not confidently reasoned through),
+    these conditions were previously unresolvable after a plain and/or/
+    xor/test with no explicit cmp - a real gap that let a genuine opaque
+    predicate built on flag reuse fall through to the LLM instead of
+    resolving deterministically.
+
+    value_independent=True is for jae/jnb/jnc, jb/jc/jnae, and jo/jno
+    specifically - their condition is PURELY "CF=0"/"CF=1"/"OF=0"/"OF=1",
+    nothing else, so once the relevant flag is guaranteed zero the
+    outcome is fixed regardless of what the actual result value even is
+    (EXTERNAL or concrete) - unlike ja/jnbe/jbe/jna/jg/jle (and aliases),
+    which ALSO depend on ZF and so genuinely do need a known value to
+    resolve. Without this, an EXTERNAL value forced "data_dependent" even
+    for these value-independent conditions - a real gap that left e.g.
+    `jnb` unresolved after `or reg, imm` on an unknown register, when
+    CF=0 was already fully guaranteed either way.
+    """
     def evaluator(state):
-        if state.last_cmp is None:
-            return "unknown", None
-        left, right, width = state.last_cmp
-        if left is EXTERNAL or right is EXTERNAL:
-            return "data_dependent", None
-        return "taken", fn(left, right, width)
+        if fn is not None and state.last_cmp is not None:
+            left, right, width = state.last_cmp
+            if left is EXTERNAL or right is EXTERNAL:
+                return "data_dependent", None
+            return "taken", fn(left, right, width)
+        if zero_fallback is not None and state.last_flags is not None:
+            value, width, cf_zero, of_zero, _refine_info = state.last_flags
+            flag_zero = cf_zero if needs == "cf" else of_zero
+            if flag_zero:
+                if value_independent:
+                    return "taken", zero_fallback(value, width)
+                if value is EXTERNAL:
+                    return "data_dependent", None
+                return "taken", zero_fallback(value, width)
+        return "unknown", None
     return evaluator
 
 
@@ -1512,7 +1720,11 @@ def _sym_zero_based(fn):
             value = (left - right) & _SYM_WIDTH_MASK[width]
             return "taken", fn(value, width)
         if state.last_flags is not None:
-            value, width = state.last_flags
+            # ZF/SF are always derivable from the result value alone,
+            # regardless of which operation produced it - unlike
+            # _sym_cmp_based's zero_fallback, this doesn't need (or check)
+            # of_cf_zero at all.
+            value, width, _cf_zero, _of_zero, _refine_info = state.last_flags
             if value is EXTERNAL:
                 return "data_dependent", None
             return "taken", fn(value, width)
@@ -1527,26 +1739,87 @@ _SYM_CONDITION_EVALUATORS = {
     "jne": _sym_zero_based(lambda v, w: v != 0),
     "js": _sym_zero_based(lambda v, w: _sym_to_signed(v, w) < 0),
     "jns": _sym_zero_based(lambda v, w: _sym_to_signed(v, w) >= 0),
+    # PF is always derivable from a concrete result value alone (only its
+    # low byte matters, regardless of operand width) - no flag guarantee
+    # needed, same family as jz/js above. Previously missing entirely -
+    # jp/jnp always fell straight to the LLM, even after a concrete
+    # result the engine could have computed parity from directly.
+    "jp": _sym_zero_based(lambda v, w: _sym_parity_even(v)),
+    "jpe": _sym_zero_based(lambda v, w: _sym_parity_even(v)),
+    "jnp": _sym_zero_based(lambda v, w: not _sym_parity_even(v)),
+    "jpo": _sym_zero_based(lambda v, w: not _sym_parity_even(v)),
 
-    "ja": _sym_cmp_based(lambda l, r, w: l > r),
-    "jnbe": _sym_cmp_based(lambda l, r, w: l > r),
-    "jae": _sym_cmp_based(lambda l, r, w: l >= r),
-    "jnb": _sym_cmp_based(lambda l, r, w: l >= r),
-    "jnc": _sym_cmp_based(lambda l, r, w: l >= r),
-    "jb": _sym_cmp_based(lambda l, r, w: l < r),
-    "jc": _sym_cmp_based(lambda l, r, w: l < r),
-    "jnae": _sym_cmp_based(lambda l, r, w: l < r),
-    "jbe": _sym_cmp_based(lambda l, r, w: l <= r),
-    "jna": _sym_cmp_based(lambda l, r, w: l <= r),
+    # zero_fallback below applies only when cf_zero is True (see
+    # SymState.last_flags) - and/or/xor/test guarantee it directly;
+    # inc/dec carry it forward from whatever it already was, since real
+    # x86 never touches CF for inc/dec. With CF guaranteed 0: ja/jnbe
+    # (CF=0,ZF=0) reduces to "value != 0", jae/jnb/jnc (CF=0) is
+    # unconditionally true, jb/jc/jnae (CF=1) is unconditionally false,
+    # jbe/jna (CF=1 or ZF=1) reduces to "value == 0".
+    "ja": _sym_cmp_based(lambda l, r, w: l > r, zero_fallback=lambda v, w: v != 0, needs="cf"),
+    "jnbe": _sym_cmp_based(lambda l, r, w: l > r, zero_fallback=lambda v, w: v != 0, needs="cf"),
+    "jae": _sym_cmp_based(lambda l, r, w: l >= r, zero_fallback=lambda v, w: True, needs="cf", value_independent=True),
+    "jnb": _sym_cmp_based(lambda l, r, w: l >= r, zero_fallback=lambda v, w: True, needs="cf", value_independent=True),
+    "jnc": _sym_cmp_based(lambda l, r, w: l >= r, zero_fallback=lambda v, w: True, needs="cf", value_independent=True),
+    "jb": _sym_cmp_based(lambda l, r, w: l < r, zero_fallback=lambda v, w: False, needs="cf", value_independent=True),
+    "jc": _sym_cmp_based(lambda l, r, w: l < r, zero_fallback=lambda v, w: False, needs="cf", value_independent=True),
+    "jnae": _sym_cmp_based(lambda l, r, w: l < r, zero_fallback=lambda v, w: False, needs="cf", value_independent=True),
+    "jbe": _sym_cmp_based(lambda l, r, w: l <= r, zero_fallback=lambda v, w: v == 0, needs="cf"),
+    "jna": _sym_cmp_based(lambda l, r, w: l <= r, zero_fallback=lambda v, w: v == 0, needs="cf"),
 
-    "jg": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) > _sym_to_signed(r, w)),
-    "jnle": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) > _sym_to_signed(r, w)),
-    "jge": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) >= _sym_to_signed(r, w)),
-    "jnl": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) >= _sym_to_signed(r, w)),
-    "jl": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) < _sym_to_signed(r, w)),
-    "jnge": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) < _sym_to_signed(r, w)),
-    "jle": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) <= _sym_to_signed(r, w)),
-    "jng": _sym_cmp_based(lambda l, r, w: _sym_to_signed(l, w) <= _sym_to_signed(r, w)),
+    # of_zero-gated (only and/or/xor/test guarantee this - inc/dec do NOT
+    # carry it forward, since their OF genuinely can be set at the signed
+    # range boundary). With OF guaranteed 0: jg/jnle (ZF=0,SF=OF) reduces
+    # to signed value > 0, jge/jnl (SF=OF) to signed value >= 0, jl/jnge
+    # (SF!=OF) to signed value < 0, jle/jng (ZF=1 or SF!=OF) to signed
+    # value <= 0 - the exact gap that let the flag-reuse opaque-predicate
+    # cascade described in the bug report fall through to the LLM instead
+    # of resolving here.
+    "jg": _sym_cmp_based(
+        lambda l, r, w: _sym_to_signed(l, w) > _sym_to_signed(r, w),
+        zero_fallback=lambda v, w: _sym_to_signed(v, w) > 0, needs="of",
+    ),
+    "jnle": _sym_cmp_based(
+        lambda l, r, w: _sym_to_signed(l, w) > _sym_to_signed(r, w),
+        zero_fallback=lambda v, w: _sym_to_signed(v, w) > 0, needs="of",
+    ),
+    "jge": _sym_cmp_based(
+        lambda l, r, w: _sym_to_signed(l, w) >= _sym_to_signed(r, w),
+        zero_fallback=lambda v, w: _sym_to_signed(v, w) >= 0, needs="of",
+    ),
+    "jnl": _sym_cmp_based(
+        lambda l, r, w: _sym_to_signed(l, w) >= _sym_to_signed(r, w),
+        zero_fallback=lambda v, w: _sym_to_signed(v, w) >= 0, needs="of",
+    ),
+    "jl": _sym_cmp_based(
+        lambda l, r, w: _sym_to_signed(l, w) < _sym_to_signed(r, w),
+        zero_fallback=lambda v, w: _sym_to_signed(v, w) < 0, needs="of",
+    ),
+    "jnge": _sym_cmp_based(
+        lambda l, r, w: _sym_to_signed(l, w) < _sym_to_signed(r, w),
+        zero_fallback=lambda v, w: _sym_to_signed(v, w) < 0, needs="of",
+    ),
+    "jle": _sym_cmp_based(
+        lambda l, r, w: _sym_to_signed(l, w) <= _sym_to_signed(r, w),
+        zero_fallback=lambda v, w: _sym_to_signed(v, w) <= 0, needs="of",
+    ),
+    "jng": _sym_cmp_based(
+        lambda l, r, w: _sym_to_signed(l, w) <= _sym_to_signed(r, w),
+        zero_fallback=lambda v, w: _sym_to_signed(v, w) <= 0, needs="of",
+    ),
+
+    # jo/jno test OF directly - purely "OF=1"/"OF=0", nothing else, so
+    # once of_zero guarantees OF=0 the outcome is fixed regardless of the
+    # actual value (same value_independent shape as jae/jb for CF).
+    # fn=None deliberately: computing signed overflow from two arbitrary
+    # cmp/sub operands correctly is a separate, riskier problem this does
+    # not take on here - only the of_zero guarantee is trusted. Previously
+    # missing entirely - jo/jno always fell straight to the LLM, even
+    # after and/or/xor/test made OF=0 fully certain either way (e.g. the
+    # classic obfuscator trick "xor reg, 0" specifically to make jno an
+    # opaque predicate).
+    "jo": _sym_cmp_based(None, zero_fallback=lambda v, w: False, needs="of", value_independent=True),
+    "jno": _sym_cmp_based(None, zero_fallback=lambda v, w: True, needs="of", value_independent=True),
 }
 
 
@@ -1584,6 +1857,56 @@ def sym_resolve_conditional_branch(state, mnem, successors, rcx_family):
     if taken:
         return "opaque", {jump_target.ea: True, fallthrough.ea: False}
     return "opaque", {jump_target.ea: False, fallthrough.ea: True}
+
+
+def _compute_and_mask_refinement(state, mnem, successors):
+    """If state.last_flags carries an AND-single-bit-mask refinement
+    opportunity (see SymState.last_flags / _sym_make_alu2's "and" case)
+    and mnem is a plain zero/nonzero test (jz/je/jnz/jne - the only
+    conditions where "!=0" is EXACTLY equivalent to "==mask", since AND
+    with a single-bit mask can only ever produce 0 or that exact mask),
+    returns {successor_ea: refined_state} - the register the AND wrote
+    is narrowed from EXTERNAL to the concrete value now provably true on
+    THAT SPECIFIC edge. Returns {} for anything else: a different
+    condition code, no pending refinement, or fewer/more than two
+    successors - deliberately narrow in scope (one bit, one specific
+    instruction pattern) rather than a general value-range/constraint
+    model. successors are assumed in gather_block's fixed
+    [jump_target, fallthrough] order, matching sym_resolve_conditional_
+    branch above.
+    """
+    if len(successors) != 2 or state.last_flags is None:
+        return {}
+    _value, width, cf_zero, of_zero, refine_info = state.last_flags
+    if refine_info is None:
+        return {}
+    if mnem not in ("jz", "je", "jnz", "jne"):
+        return {}
+    family, mask = refine_info
+    jump_target, fallthrough = successors[0], successors[1]
+    if mnem in ("jz", "je"):
+        zero_succ, nonzero_succ = jump_target, fallthrough
+    else:
+        nonzero_succ, zero_succ = jump_target, fallthrough
+    refined = {}
+    if zero_succ.ea is not None:
+        s0 = state.copy()
+        s0.write_reg(family, 0)
+        # Refining regs[family] alone would not help a SUBSEQUENT
+        # flags-based Jcc (jle/jg/etc.) reached with no intervening
+        # flag-setting instruction - those consult last_flags directly,
+        # never re-derive it from a register. Refine both, so the very
+        # next such condition resolves precisely instead of still
+        # seeing EXTERNAL there. refine_info is cleared (already
+        # "consumed" - this concrete value needs no further narrowing).
+        s0.last_flags = (0, width, cf_zero, of_zero, None)
+        refined[zero_succ.ea] = s0
+    if nonzero_succ.ea is not None:
+        s1 = state.copy()
+        s1.write_reg(family, mask)
+        s1.last_flags = (mask, width, cf_zero, of_zero, None)
+        refined[nonzero_succ.ea] = s1
+    return refined
 
 
 def sym_resolve_indirect_jump(state, target_operand, successors):
@@ -1844,7 +2167,7 @@ def render_block_text(insn_eas):
     return "\n".join(lines)
 
 
-def gather_block(start_ea, max_instrs=_MAX_BLOCK_INSTRS):
+def gather_block(start_ea, max_instrs=_MAX_BLOCK_INSTRS, claimed_insns=None):
     """Walks linearly forward from start_ea, one basic block's worth of
     instructions, classifying how it ends and enumerating its successors.
     Does not recurse into successors - callers drive the worklist.
@@ -1859,6 +2182,23 @@ def gather_block(start_ea, max_instrs=_MAX_BLOCK_INSTRS):
     see CfgTraceRunner for how these calls are kept off
     LlamaStreamWorker's MFF_FAST callback thread context.
 
+    claimed_insns, if given, is a dict shared across every gather_block()
+    call within the same trace (ea -> instruction size), used to detect
+    a target landing STRICTLY inside an instruction some OTHER block in
+    this trace already claimed and fixed up - a classic overlapping-
+    instruction obfuscation trick (the same bytes decode differently
+    depending on which address you start from). Re-walking into the
+    middle of an already-established item would otherwise silently
+    DESTROY that earlier block's boundary - del_items() deletes the
+    WHOLE item covering any address passed to it, not just the requested
+    range - corrupting what that earlier (possibly already-marked-real)
+    block's own insn_eas point to, even though its actual REAL/DEAD
+    verdict logic (decode_insn-based, independent of IDA's item state)
+    remains correct. When detected, the walk stops immediately WITHOUT
+    touching those bytes at all; the caller treats this the same as
+    "undecodable"/"truncated" - flagged for manual review rather than
+    guessing which interpretation of the overlapping bytes is real.
+
     BlockInfo.text is intentionally left empty here - call
     render_block_text(block.insn_eas) if you actually need it (see that
     function's docstring for why this is lazy).
@@ -1867,6 +2207,13 @@ def gather_block(start_ea, max_instrs=_MAX_BLOCK_INSTRS):
     sym_insns = []
     ea = start_ea
     for _ in range(max_instrs):
+        if claimed_insns is not None:
+            overlap_start, overlap_size = _find_overlapping_claim(ea, claimed_insns)
+            if overlap_start is not None:
+                return BlockInfo(
+                    start_ea=start_ea, end_ea=ea, text="", kind="overlap",
+                    successors=[], last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
+                )
         insn = ida_ua.insn_t()
         size = ida_ua.decode_insn(insn, ea)
         if size <= 0:
@@ -1875,6 +2222,8 @@ def gather_block(start_ea, max_instrs=_MAX_BLOCK_INSTRS):
                 successors=[], last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
             )
         _fixup_instruction_boundary(ea, size)
+        if claimed_insns is not None:
+            claimed_insns[ea] = size
         insn_eas.append(ea)
 
         feature = insn.get_canon_feature()
@@ -3649,6 +3998,57 @@ CfgTraceResult = namedtuple(
     ["blocks", "partial", "blocks_processed", "unexplored", "error", "symbolic_resolved_count", "jump_patches"],
 )
 
+# Cached in LLMExplainerPlugin._trace_cache, keyed by the trace's start
+# address, so reopening Trace/Recover CFG on the same address can jump
+# straight to the review page (transcript + table) without re-running
+# anything - review-only or Accept still work identically off of it,
+# since both just read runner/result, same as a freshly-finished trace.
+# In-memory only (cleared on plugin term()/IDA close) - not persisted to
+# the IDB, since pickling BlockInfo/SymInsn trees across code changes
+# would be fragile; the cost of that is a cold cache after restarting IDA,
+# which is a fair tradeoff against locking in a serialization format.
+_CachedCfgTrace = namedtuple("_CachedCfgTrace", ["runner", "result", "timestamp"])
+
+# Cached in LLMExplainerPlugin._applied_cfg_patches, keyed by the trace's
+# start address, recording exactly which byte ranges "Patch in place" or
+# "Rebuild linear" touched when last accepted there - enough to drive
+# Undo Patches (see _undo_applied_cfg_patch) without needing to separately
+# remember each byte's original value: IDA already tracks that itself for
+# every patched byte (ida_bytes.revert_byte reads it back directly), this
+# only needs to know WHICH addresses were touched by THIS plugin's own
+# patch, so Undo never reverts something else entirely (e.g. a manual
+# patch the user made elsewhere in the same range via IDA's own tools).
+# touched_ranges: list of (start_ea, end_ea) byte ranges. In-memory only,
+# same tradeoff as _CachedCfgTrace above.
+_AppliedCfgPatch = namedtuple("_AppliedCfgPatch", ["mode", "touched_ranges", "timestamp"])
+
+
+def _undo_applied_cfg_patch(applied):
+    """Reverts every byte in applied.touched_ranges back to its original
+    value via ida_bytes.revert_byte (IDA's own recorded pre-patch byte,
+    not anything this plugin stored itself), then re-analyzes each range
+    so the disassembly reflects the reverted bytes. Returns the number of
+    bytes actually reverted (a byte with nothing to revert - e.g. already
+    reverted by hand via Edit > Patches - is simply skipped, not an error).
+    """
+    reverted = 0
+    for start, end in applied.touched_ranges:
+        for ea in range(start, end):
+            try:
+                if ida_bytes.revert_byte(ea):
+                    reverted += 1
+            except Exception:
+                pass
+        try:
+            ida_bytes.del_items(start, ida_bytes.DELIT_SIMPLE, end - start)
+        except Exception:
+            pass
+        try:
+            ida_auto.plan_and_wait(start, end)
+        except Exception:
+            pass
+    return reverted
+
 # A fully-resolved binary opaque predicate found during the trace: a
 # conditional_branch block whose two successors have opposite verdicts
 # (one real, one dead) - the only case eligible for jump patching. NOT
@@ -3699,6 +4099,15 @@ class CfgTraceRunner(object):
         # real predecessor than the one that originally decided them -
         # see _enqueue's dispatcher-revisit handling.
         self._corrected_dispatchers = set()
+        # ea -> instruction size, for every instruction any gather_block()
+        # call has claimed and fixed up so far in this trace (real, dead,
+        # or marking-only) - shared across every gather_block() call below
+        # so a later target landing in the MIDDLE of an already-claimed
+        # instruction (an overlapping-instruction obfuscation trick) is
+        # detected and refused, rather than silently destroying the
+        # earlier block's already-established boundary. See gather_block
+        # and _find_overlapping_claim.
+        self.claimed_insns = {}
 
         # ea -> SymState as of the end of that block's predecessor (i.e.
         # the state to run THIS block's own instructions against). Seeded
@@ -3760,14 +4169,22 @@ class CfgTraceRunner(object):
             # traced as real, or the conflict-flagged address would be
             # silently dropped from the recovered path entirely.
             self.blocks_processed += 1
-            block = gather_block(ea)
+            block = gather_block(ea, claimed_insns=self.claimed_insns)
             self._log("Block %#010x (%s, %d instr)" % (ea, block.kind, len(block.insn_eas)))
 
-            if block.kind in ("undecodable", "truncated"):
-                note = (
-                    "Address did not decode as a valid instruction." if block.kind == "undecodable"
-                    else "Hit the per-block instruction safety cap while decoding; needs manual review."
-                )
+            if block.kind in ("undecodable", "truncated", "overlap"):
+                if block.kind == "undecodable":
+                    note = "Address did not decode as a valid instruction."
+                elif block.kind == "truncated":
+                    note = "Hit the per-block instruction safety cap while decoding; needs manual review."
+                else:
+                    note = (
+                        "This address lands in the middle of an instruction a different block in "
+                        "this trace already claimed - likely an overlapping-instruction obfuscation "
+                        "trick (the same bytes decode differently depending on the start offset). "
+                        "Stopped here without touching those bytes; needs manual review to determine "
+                        "which interpretation is real."
+                    )
                 self._flag_unresolved(ea, note, self.predecessors.get(ea), block=block)
                 continue
 
@@ -3806,6 +4223,7 @@ class CfgTraceRunner(object):
         has_back_edge = any(
             s.ea is not None and self._is_ancestor(s.ea, block.start_ea) for s in block.successors
         )
+        refined_states = {}
         if block.kind == "conditional_branch":
             if len(block.successors) != 2 or not block.sym_insns:
                 return False
@@ -3813,6 +4231,11 @@ class CfgTraceRunner(object):
             kind, verdicts = sym_resolve_conditional_branch(
                 sym_state, last_mnem, block.successors, _family_of("rcx")
             )
+            # Per-edge state narrowing (see _compute_and_mask_refinement):
+            # a genuinely correct no-op for anything not the specific
+            # AND-single-bit-mask + jz/je/jnz/jne pattern it targets, so
+            # always safe to compute here regardless of "kind".
+            refined_states = _compute_and_mask_refinement(sym_state, last_mnem, block.successors)
         elif block.kind == "indirect_jump":
             if not block.sym_insns or not block.sym_insns[-1].operands:
                 return False
@@ -3853,7 +4276,9 @@ class CfgTraceRunner(object):
             if succ.ea is None or succ.ea not in verdicts:
                 continue
             verdict = "real" if verdicts[succ.ea] else "dead"
-            self._apply_target_verdict(succ.ea, verdict, reason, block.start_ea)
+            self._apply_target_verdict(
+                succ.ea, verdict, reason, block.start_ea, sym_state_override=refined_states.get(succ.ea),
+            )
         return True
 
     def _enqueue(self, ea, predecessor_ea, summary, sym_state=None):
@@ -4259,7 +4684,7 @@ class CfgTraceRunner(object):
                 )
                 self._flag_unresolved(succ.ea, "Model did not address this candidate.", block.start_ea)
 
-    def _apply_target_verdict(self, addr, verdict, reason, predecessor_ea):
+    def _apply_target_verdict(self, addr, verdict, reason, predecessor_ea, sym_state_override=None):
         if addr in self._unresolved_eas and self._target_state(addr) is None:
             # A later path resolves what an earlier path could not - this
             # is an upgrade, not a conflict, so let it through.
@@ -4285,7 +4710,8 @@ class CfgTraceRunner(object):
                 summary += ": " + reason
             self.decision_summary[addr] = summary
             self._log("Block %#010x -> %#010x marked REAL: %s" % (predecessor_ea, addr, reason or "(no reason given)"))
-            self._enqueue(addr, predecessor_ea, summary, self._current_block_sym_state)
+            state_to_propagate = sym_state_override if sym_state_override is not None else self._current_block_sym_state
+            self._enqueue(addr, predecessor_ea, summary, state_to_propagate)
         elif verdict == "dead":
             if existing == "real":
                 self._log(
@@ -4304,7 +4730,7 @@ class CfgTraceRunner(object):
             self.dead_reason[addr] = reason or ""
             if addr not in self.dead_blocks:
                 try:
-                    self.dead_blocks[addr] = gather_block(addr)
+                    self.dead_blocks[addr] = gather_block(addr, claimed_insns=self.claimed_insns)
                 except Exception:
                     pass
         else:  # "unresolved"
@@ -4325,7 +4751,7 @@ class CfgTraceRunner(object):
             self._unresolved_eas.add(ea)
             if block is None and ea not in self.visited and ea not in self.dead:
                 try:
-                    block = gather_block(ea)
+                    block = gather_block(ea, claimed_insns=self.claimed_insns)
                 except Exception:
                     block = None
         self.unresolved.append({
@@ -4396,16 +4822,21 @@ def _patch_nop_instruction(ea):
     whatever is really there right now) and overwrites every one of its
     bytes with NOP (0x90) - safe for any instruction length since NOP is
     a valid single-byte filler, no multi-byte NOP encoding needed.
+    Returns the number of bytes touched, so the caller can record exactly
+    what this patch covers (for Undo Patches - see _AppliedCfgPatch).
     """
     probe = ida_ua.insn_t()
     size = ida_ua.decode_insn(probe, ea)
     if size <= 0:
         size = 1  # could not decode - NOP at least the one byte we know about
     _patch_bytes_and_reanalyze(ea, b"\x90" * size)
+    return size
 
 
 def _patch_jcc_to_real_target(jcc_ea, real_target_ea, role_of_real):
-    """Returns (ok, reason_or_None). Re-decodes the instruction at jcc_ea
+    """Returns (ok, reason_or_None, size_or_None) - size is the number of
+    bytes touched (for Undo Patches - see _AppliedCfgPatch), only
+    meaningful when ok is True. Re-decodes the instruction at jcc_ea
     fresh (never trusts stale data) and verifies its raw bytes match one
     of exactly two recognized x86 Jcc encodings before touching anything -
     see _compute_jcc_patch_bytes. Any other encoding (jcxz, unusual
@@ -4415,18 +4846,491 @@ def _patch_jcc_to_real_target(jcc_ea, real_target_ea, role_of_real):
     insn = ida_ua.insn_t()
     size = ida_ua.decode_insn(insn, jcc_ea)
     if size <= 0:
-        return False, "could not decode instruction at %#010x" % jcc_ea
+        return False, "could not decode instruction at %#010x" % jcc_ea, None
     try:
         raw = ida_bytes.get_bytes(jcc_ea, size)
     except Exception as exc:
-        return False, "could not read instruction bytes: %s" % exc
+        return False, "could not read instruction bytes: %s" % exc, None
     if raw is None or len(raw) != size:
-        return False, "could not read instruction bytes at %#010x" % jcc_ea
+        return False, "could not read instruction bytes at %#010x" % jcc_ea, None
     patch = _compute_jcc_patch_bytes(jcc_ea, size, raw, real_target_ea, role_of_real)
     if patch is None:
-        return False, "unrecognized or inconsistent Jcc encoding at %#010x (size=%d) - not patched" % (jcc_ea, size)
+        return False, "unrecognized or inconsistent Jcc encoding at %#010x (size=%d) - not patched" % (jcc_ea, size), None
     _patch_bytes_and_reanalyze(jcc_ea, patch)
-    return True, None
+    return True, None, size
+
+
+# ---------------------------------------------------------------------------
+# CFG trace: "Rebuild linear" - an alternative to in-place patching that
+# leaves every original byte untouched EXCEPT the function's own entry
+# point through the end of the newly rebuilt code. Every confirmed-real
+# block (runner.visited - already the complete, closed set reachable from
+# the trace's start address) is concatenated into one straight-line
+# sequence with every control transfer re-encoded explicitly (never
+# relying on layout adjacency), written starting exactly at the entry
+# point. A block that cannot be safely relocated (RIP-relative addressing,
+# or an indirect dispatch with more than one genuinely real case) is left
+# at its original address entirely untouched, PROVIDED that address and
+# every relocatable block's reference to it fall outside the rebuilt
+# range - otherwise the whole rebuild is refused rather than guessed at.
+# See _plan_linear_rebuild (pure, tested standalone) for the actual
+# layout/encoding math, and _gather_linear_rebuild_plan for the glue that
+# turns real IDA state into its inputs.
+# ---------------------------------------------------------------------------
+
+_RawPart = namedtuple("_RawPart", ["data"])
+# A direct `call rel32` (always E8 + 4-byte rel32, 5 bytes total) embedded
+# in a block's body - its absolute target doesn't move when the CALLER is
+# relocated, so the displacement must be recomputed, unlike a plain
+# RawPart which is copied verbatim.
+_CallPart = namedtuple("_CallPart", ["target_ea"])
+
+# Terminator kinds - always re-encoded explicitly, never left to rely on
+# whatever happens to be adjacent after layout:
+_VerbatimTerm = namedtuple("_VerbatimTerm", ["data"])  # ret, or an indirect jump/call with no PC-relative content - copied as-is
+_SingleJump = namedtuple("_SingleJump", ["target_ea"])  # -> JMP rel32 (5 bytes) to the target's new address
+_TwoWay = namedtuple("_TwoWay", ["cond_byte", "jump_target_ea", "fallthrough_ea"])  # -> Jcc rel32 (6B) + JMP rel32 (5B)
+
+_RelocBlock = namedtuple("_RelocBlock", ["start_ea", "parts", "terminator"])
+
+# What _gather_linear_rebuild_plan / _plan_linear_rebuild return.
+LinearRebuildPlan = namedtuple(
+    "LinearRebuildPlan",
+    ["entry_ea", "new_addr_by_old_start", "code", "relocated_count", "anchored_count", "error"],
+)
+
+
+def _plan_linear_rebuild(entry_ea, layout_order, blocks_by_ea, anchored_ranges, anchored_targets, available_bytes):
+    """Pure layout/encoding algorithm - no IDA calls, verified standalone
+    before being wired in here (see test_linear_rebuild.py). Two-pass:
+    sizes (fixed per block, independent of final position) determine
+    every block's new address first; only then are the actual bytes
+    generated, since displacements can be forward references. Returns
+    (new_addr_by_old_start, code_bytes, None) on success, or
+    (None, None, reason) on refusal - never raises for a bad/unsupported
+    input shape it can detect, never guesses at an out-of-range
+    displacement (verified via an explicit round-trip check, the same
+    discipline _compute_jcc_patch_bytes already applies).
+    """
+    if not layout_order or layout_order[0] != entry_ea:
+        return None, None, "layout must start with the function's entry address"
+    if len(set(layout_order)) != len(layout_order):
+        return None, None, "layout_order contains a duplicate address"
+    for ea in layout_order:
+        if ea not in blocks_by_ea:
+            return None, None, "block %#010x in layout has no relocation info" % ea
+
+    def _term_size(term):
+        if isinstance(term, _VerbatimTerm):
+            return len(term.data)
+        if isinstance(term, _SingleJump):
+            return 5
+        if isinstance(term, _TwoWay):
+            return 11
+        raise ValueError("unknown terminator type")
+
+    def _block_size(block):
+        size = 0
+        for part in block.parts:
+            size += len(part.data) if isinstance(part, _RawPart) else 5
+        return size + _term_size(block.terminator)
+
+    new_addr_by_old_start = {}
+    offset = 0
+    for ea in layout_order:
+        new_addr_by_old_start[ea] = entry_ea + offset
+        offset += _block_size(blocks_by_ea[ea])
+    total_size = offset
+
+    if total_size > available_bytes:
+        return None, None, (
+            "rebuilt code needs %d byte(s), only %d available in the function's "
+            "already-explored range" % (total_size, available_bytes)
+        )
+
+    canvas_start, canvas_end = entry_ea, entry_ea + total_size
+    for (a_start, a_end) in anchored_ranges:
+        if a_start < canvas_end and canvas_start < a_end:
+            return None, None, (
+                "an unrelocatable block at %#010x-%#010x overlaps the rebuilt code's range" % (a_start, a_end)
+            )
+    for t_ea in anchored_targets:
+        if canvas_start <= t_ea < canvas_end:
+            return None, None, (
+                "an unrelocatable block's target %#010x falls inside the rebuilt code's range" % t_ea
+            )
+
+    def _rel32_or_none(from_ea_after_insn, target):
+        rel32 = (target - from_ea_after_insn) & 0xFFFFFFFF
+        signed = rel32 if rel32 < 0x80000000 else rel32 - 0x100000000
+        if (from_ea_after_insn + signed) & _PATCH_MASK64 != target & _PATCH_MASK64:
+            return None
+        return rel32
+
+    out = bytearray()
+    for ea in layout_order:
+        block = blocks_by_ea[ea]
+        cursor = new_addr_by_old_start[ea]
+        for part in block.parts:
+            if isinstance(part, _RawPart):
+                out += part.data
+                cursor += len(part.data)
+            else:
+                rel32 = _rel32_or_none(cursor + 5, part.target_ea)
+                if rel32 is None:
+                    return None, None, "call target %#010x is out of rel32 range from the relocated call site" % part.target_ea
+                out += bytes([0xE8]) + rel32.to_bytes(4, "little")
+                cursor += 5
+        term = block.terminator
+        if isinstance(term, _VerbatimTerm):
+            out += term.data
+        elif isinstance(term, _SingleJump):
+            target = new_addr_by_old_start.get(term.target_ea, term.target_ea)
+            rel32 = _rel32_or_none(cursor + 5, target)
+            if rel32 is None:
+                return None, None, "jump target %#010x is out of rel32 range" % target
+            out += bytes([0xE9]) + rel32.to_bytes(4, "little")
+        elif isinstance(term, _TwoWay):
+            jt = new_addr_by_old_start.get(term.jump_target_ea, term.jump_target_ea)
+            ft = new_addr_by_old_start.get(term.fallthrough_ea, term.fallthrough_ea)
+            jcc_rel32 = _rel32_or_none(cursor + 6, jt)
+            if jcc_rel32 is None:
+                return None, None, "conditional jump target %#010x is out of rel32 range" % jt
+            out += bytes([0x0F, term.cond_byte]) + jcc_rel32.to_bytes(4, "little")
+            jmp_ea = cursor + 6
+            jmp_rel32 = _rel32_or_none(jmp_ea + 5, ft)
+            if jmp_rel32 is None:
+                return None, None, "fallthrough target %#010x is out of rel32 range" % ft
+            out += bytes([0xE9]) + jmp_rel32.to_bytes(4, "little")
+        else:
+            raise ValueError("unknown terminator type")
+
+    return new_addr_by_old_start, bytes(out), None
+
+
+def _operand_is_rip_relative(ea, insn):
+    """True if any operand of the instruction at ea renders with "rip" in
+    its text (IDA's standard way of showing x64 RIP-relative addressing,
+    e.g. "[rip+0x2000]"). Text-based, matching this file's established
+    pattern for addressing details not safely reachable via documented
+    raw op_t fields (see _parse_memory_operand_text) - a relocated copy
+    of a RIP-relative instruction would compute the wrong address (RIP-
+    relative displacements are relative to the NEXT instruction, which
+    moves when relocated), so any block containing one is never a
+    relocation candidate.
+    """
+    for i in range(8):
+        try:
+            op = insn.ops[i]
+        except Exception:
+            break
+        if op.type == ida_ua.o_void:
+            break
+        try:
+            text = idc.print_operand(ea, i) or ""
+        except Exception:
+            continue
+        if "rip" in text.lower():
+            return True
+    return False
+
+
+def _classify_block_for_rebuild(ea, block, visited):
+    """Returns ("relocatable", parts, terminator) or ("anchored", None, None).
+    parts/terminator are the _RawPart/_CallPart list and terminator value
+    for _RelocBlock - built from FRESH decode_insn/get_bytes calls (never
+    trusts block.insn_eas' vintage), refusing (anchoring) at the first
+    sign of anything not confidently handled: RIP-relative addressing
+    anywhere in the block, an unrecognized instruction, or (for the
+    terminator specifically) more than one genuinely real successor on an
+    indirect jump - see the module docstring above for why.
+    """
+    real_successors = [s for s in block.successors if s.ea is not None and s.ea in visited]
+    body_eas = block.insn_eas[:-1] if block.insn_eas else []
+    parts = []
+    for insn_ea in body_eas:
+        insn = ida_ua.insn_t()
+        size = ida_ua.decode_insn(insn, insn_ea)
+        if size <= 0:
+            return "anchored", None, None
+        if _operand_is_rip_relative(insn_ea, insn):
+            return "anchored", None, None
+        try:
+            raw = ida_bytes.get_bytes(insn_ea, size)
+        except Exception:
+            raw = None
+        if raw is None or len(raw) != size:
+            return "anchored", None, None
+        is_call = bool(insn.get_canon_feature() & ida_idp.CF_CALL)
+        if is_call:
+            try:
+                direct_targets = list(idautils.CodeRefsFrom(insn_ea, 0))
+            except Exception:
+                direct_targets = []
+            if len(direct_targets) == 1 and size == 5 and raw[0] == 0xE8:
+                parts.append(_CallPart(target_ea=direct_targets[0]))
+                continue
+        parts.append(_RawPart(data=raw))
+
+    if not block.insn_eas:
+        return "anchored", None, None
+    term_ea = block.insn_eas[-1]
+    term_insn = ida_ua.insn_t()
+    term_size = ida_ua.decode_insn(term_insn, term_ea)
+    if term_size <= 0:
+        return "anchored", None, None
+    if _operand_is_rip_relative(term_ea, term_insn):
+        return "anchored", None, None
+    try:
+        term_raw = ida_bytes.get_bytes(term_ea, term_size)
+    except Exception:
+        term_raw = None
+    if term_raw is None or len(term_raw) != term_size:
+        return "anchored", None, None
+
+    if block.kind == "return":
+        return "relocatable", parts, _VerbatimTerm(data=term_raw)
+    if block.kind in ("unconditional_jump", "indirect_jump") and len(real_successors) == 1:
+        return "relocatable", parts, _SingleJump(target_ea=real_successors[0].ea)
+    if block.kind == "indirect_jump" and len(real_successors) == 0:
+        # A raw register/memory-indirect jump IDA couldn't enumerate any
+        # case for - safe to copy verbatim (no PC-relative content, just
+        # confirmed above) regardless of where it ends up.
+        return "relocatable", parts, _VerbatimTerm(data=term_raw)
+    if block.kind == "conditional_branch" and len(real_successors) == 2:
+        jump_succ = next((s for s in block.successors if s.role == "jump_target"), None)
+        fall_succ = next((s for s in block.successors if s.role == "fallthrough"), None)
+        if jump_succ is None or fall_succ is None:
+            return "anchored", None, None
+        if term_size < 2 or not (0x0F == term_raw[0] and 0x80 <= term_raw[1] <= 0x8F) and not (0x70 <= term_raw[0] <= 0x7F):
+            return "anchored", None, None
+        cond_byte = term_raw[1] if term_raw[0] == 0x0F else (term_raw[0] - 0x70 + 0x80)
+        return "relocatable", parts, _TwoWay(
+            cond_byte=cond_byte, jump_target_ea=jump_succ.ea, fallthrough_ea=fall_succ.ea,
+        )
+    if block.kind == "conditional_branch" and len(real_successors) == 1:
+        return "relocatable", parts, _SingleJump(target_ea=real_successors[0].ea)
+    # 2+ real successors on an indirect_jump (a live multi-case dispatch),
+    # 0 real successors on anything but a return/no-candidate-indirect
+    # (an undecided branch, e.g. from a cancelled/partial trace), or
+    # anything else not explicitly recognized above - anchor rather than
+    # guess.
+    return "anchored", None, None
+
+
+def _max_contiguous_claimed_run(entry_ea, claimed_insns):
+    """How many bytes starting exactly at entry_ea are covered, with no
+    gaps, by instructions this trace has already claimed (real or dead).
+    Used only as the fast path inside _rebuild_canvas_available_bytes
+    below - a real obfuscated function's real/dead blocks are rarely
+    packed with zero gaps between them (unexplored padding, alignment,
+    or simply bytes no edge this trace found ever pointed at), so
+    stopping here entirely would refuse far more often than necessary;
+    see that function for how gaps get cautiously crossed instead.
+    """
+    total = 0
+    ea = entry_ea
+    while True:
+        size = claimed_insns.get(ea)
+        if size is None:
+            break
+        total += size
+        ea += size
+    return total
+
+
+def _rebuild_canvas_available_bytes(entry_ea, envelope_start, envelope_end, claimed_insns):
+    """Bytes starting at entry_ea safe to use as the Rebuild Linear
+    canvas, extending up to envelope_end (the furthest address any block
+    this trace examined - real, dead, or unresolved - reaches).
+    envelope_start is the earliest such address (can be before entry_ea -
+    a back edge or shared/tail-merged block can legitimately sit there).
+    Bytes already claimed by this trace (real or dead) are always safe by
+    construction and skipped over at their full instruction size. A GAP
+    byte/item (claimed by neither) is ALSO treated as safe UNLESS:
+      - it belongs to a DIFFERENT existing IDA function than the one (if
+        any) already recognized at entry_ea - obfuscated functions are
+        very often ALREADY defined as one proc by IDA's own auto-
+        analysis (this feature doesn't require them not to be; that's
+        only ever true for the entry-point-not-recognized-at-all case),
+        and a gap byte inside that SAME function is exactly the ordinary
+        junk/decoy padding this is meant to cross, not something to stop
+        at, or
+      - it has an xref (code or data) from an address OUTSIDE
+        [envelope_start, envelope_end) - i.e. genuinely outside every
+        block this trace ever looked at, in any verdict. A flattening
+        dispatcher's decoy/junk blocks routinely cross-reference EACH
+        OTHER without any of them ever being walked as real or dead (the
+        trace correctly never needed to visit unreachable junk) - an
+        xref from another address the trace simply didn't individually
+        classify is not evidence of anything external, only an xref from
+        truly outside the whole span this trace ever examined is.
+    This lets a genuinely scattered obfuscated function (real/dead
+    blocks separated by unexplored padding/junk - the common case for
+    OLLVM-style flattening) use its true extent instead of refusing at
+    the first unexplored byte, while still refusing to eat into a
+    genuinely different, already-recognized function or anything still
+    referenced from truly outside this trace's whole span. Steps by
+    IDA's own existing item size when one is defined in a gap (so an
+    already-analyzed data item is checked - and skipped - as a whole,
+    not split awkwardly), one byte at a time otherwise.
+
+    Returns (available_bytes, stop_reason) - stop_reason is a short,
+    human-readable explanation of exactly where and why the search
+    stopped (hit the envelope cleanly, a different function, or an
+    external xref), surfaced in the "Cannot rebuild" message so a refusal
+    can actually be diagnosed instead of just reporting two numbers.
+    """
+    try:
+        entry_func = ida_funcs.get_func(entry_ea)
+    except Exception:
+        entry_func = None
+    entry_func_start = entry_func.start_ea if entry_func is not None else None
+
+    ea = entry_ea
+    stop_reason = "reached the furthest address this trace explored (%#010x)" % envelope_end
+    while ea < envelope_end:
+        size = claimed_insns.get(ea)
+        if size is not None:
+            ea += size
+            continue
+        try:
+            func_here = ida_funcs.get_func(ea)
+        except Exception:
+            func_here = None
+        if func_here is not None and func_here.start_ea != entry_func_start:
+            try:
+                other_name = idc.get_func_name(ea) or ("%#010x" % func_here.start_ea)
+            except Exception:
+                other_name = "%#010x" % func_here.start_ea
+            stop_reason = (
+                "hit a different function (%s, starting at %#010x) at %#010x"
+                % (other_name, func_here.start_ea, ea)
+            )
+            break  # a genuinely DIFFERENT function's territory - stop here
+        try:
+            refs = list(idautils.XrefsTo(ea, 0))
+        except Exception:
+            refs = []
+        external_frm = next(
+            (
+                getattr(xref, "frm", None) for xref in refs
+                if not (envelope_start <= getattr(xref, "frm", -1) < envelope_end)
+            ),
+            None,
+        )
+        if external_frm is not None:
+            stop_reason = (
+                "%#010x is referenced from %#010x, an address outside everything this trace examined"
+                % (ea, external_frm)
+            )
+            break  # referenced from truly outside this trace's whole span - stop here
+        try:
+            step = ida_bytes.get_item_size(ea) or 1
+        except Exception:
+            step = 1
+        ea += max(step, 1)
+    return min(ea, envelope_end) - entry_ea, stop_reason
+
+
+def _gather_linear_rebuild_plan(runner):
+    """Builds every input _plan_linear_rebuild needs from a finished
+    CfgTraceRunner's real IDA state, then calls it. runner.visited is
+    already the complete, closed set of confirmed-real blocks reachable
+    from the trace's start address - not subject to the review table's
+    checkboxes, since a partial linearization missing some of the real
+    control flow would not be a safe/meaningful rebuild (checkboxes still
+    control Mark-only coloring as before). Returns a LinearRebuildPlan;
+    .error is None on success.
+    """
+    entry_ea = runner.start_ea
+    layout_order = list(runner.visited.keys())
+    if not layout_order or layout_order[0] != entry_ea:
+        # dict order should always start with the trace's own seed, but
+        # never trust that blindly - reorder defensively if not.
+        layout_order = [entry_ea] + [ea for ea in layout_order if ea != entry_ea]
+    if entry_ea not in runner.visited:
+        return LinearRebuildPlan(entry_ea, None, None, 0, 0, "the function's own entry point was never confirmed real")
+
+    blocks_by_ea = {}
+    anchored_ranges = []
+    anchored_targets = set()
+    relocated_count = 0
+    anchored_count = 0
+    envelope_start = entry_ea
+    envelope_end = entry_ea
+    for ea, block in runner.visited.items():
+        envelope_start = min(envelope_start, block.start_ea)
+        envelope_end = max(envelope_end, block.end_ea)
+        kind, parts, terminator = _classify_block_for_rebuild(ea, block, runner.visited)
+        if kind == "relocatable":
+            blocks_by_ea[ea] = _RelocBlock(start_ea=ea, parts=parts, terminator=terminator)
+            relocated_count += 1
+        else:
+            anchored_ranges.append((block.start_ea, block.end_ea))
+            for succ in block.successors:
+                if succ.ea is not None:
+                    anchored_targets.add(succ.ea)
+            anchored_count += 1
+
+    # dead_blocks are already fully covered by claimed_insns (safe to
+    # overwrite, that's the whole point of removing dead code), but
+    # unresolved ones are exactly "we don't know if this is real" - never
+    # let the canvas eat into one of those, same protection as an
+    # unrelocatable real block above. All three also extend the envelope:
+    # the full span this trace looked at, in any verdict, bounds how far
+    # the gap-crossing search below is even allowed to consider, and (via
+    # envelope_start) which xrefs count as "from within this same blob"
+    # rather than genuinely external - see _rebuild_canvas_available_bytes.
+    for block in runner.dead_blocks.values():
+        envelope_start = min(envelope_start, block.start_ea)
+        envelope_end = max(envelope_end, block.end_ea)
+    for item in runner.unresolved:
+        block = item.get("block")
+        if block is not None:
+            anchored_ranges.append((block.start_ea, block.end_ea))
+            envelope_start = min(envelope_start, block.start_ea)
+            envelope_end = max(envelope_end, block.end_ea)
+        else:
+            anchor = item.get("anchor_ea")
+            if anchor is not None:
+                anchored_ranges.append((anchor, anchor + 1))
+                envelope_start = min(envelope_start, anchor)
+                envelope_end = max(envelope_end, anchor + 1)
+
+    if entry_ea not in blocks_by_ea:
+        return LinearRebuildPlan(
+            entry_ea, None, None, relocated_count, anchored_count,
+            "the entry block itself could not be safely relocated (RIP-relative addressing or "
+            "an unresolved/multi-case indirect jump) - nothing valid could be placed at the "
+            "entry point without either moving it (unsafe) or leaving it exactly as-is",
+        )
+    layout_order = [ea for ea in layout_order if ea in blocks_by_ea]
+
+    available_bytes, stop_reason = _rebuild_canvas_available_bytes(
+        entry_ea, envelope_start, envelope_end, runner.claimed_insns,
+    )
+    new_addr_by_old_start, code, err = _plan_linear_rebuild(
+        entry_ea, layout_order, blocks_by_ea, anchored_ranges, anchored_targets, available_bytes,
+    )
+    if err is not None:
+        # Surface exactly where/why the available-space search stopped for
+        # the specific "doesn't fit" refusal - the only case that number
+        # actually depends on the search above rather than an overlap
+        # conflict (which already names its own address).
+        if "available in the function" in err:
+            err = "%s - the search %s" % (err, stop_reason)
+        return LinearRebuildPlan(entry_ea, None, None, relocated_count, anchored_count, err)
+    return LinearRebuildPlan(entry_ea, new_addr_by_old_start, code, relocated_count, anchored_count, None)
+
+
+def _apply_linear_rebuild(plan):
+    """Writes plan.code starting at plan.entry_ea - the ONLY bytes this
+    touches anywhere in the binary. Reuses _patch_bytes_and_reanalyze
+    (patch_byte per byte + del_items + plan_and_wait) exactly like every
+    other patch in this file.
+    """
+    _patch_bytes_and_reanalyze(plan.entry_ea, plan.code)
 
 
 def _ensure_function_at(start_ea):
@@ -4463,7 +5367,7 @@ def _ensure_function_at(start_ea):
     return "Created a function at %#010x so it can be decompiled." % start_ea
 
 
-def _apply_cfg_trace_and_refresh(config, items, jump_patches=None, start_ea=None):
+def _apply_cfg_trace_and_refresh(config, items, jump_patches=None, start_ea=None, touched_ranges=None):
     """One execute_sync/MFF_WRITE round-trip for the whole accepted set.
     Always marks/comments (color + comment only, per the confirmed v1
     scope). If jump_patches is not None (only when the user explicitly
@@ -4474,7 +5378,11 @@ def _apply_cfg_trace_and_refresh(config, items, jump_patches=None, start_ea=None
     a proper function exists at start_ea (see _ensure_function_at) -
     only in patch mode, since forcing a function boundary is itself a
     database change beyond plain color/comment marking, consistent with
-    everything else this option gates.
+    everything else this option gates. If touched_ranges (a list) is
+    given, every (start, end) byte range actually patched is appended to
+    it, so the caller can record precisely what to revert later (Undo
+    Patches - see _AppliedCfgPatch); coloring/comments are never
+    recorded there, since those aren't bytes and Undo only reverts bytes.
     Colors are idc.set_color's native 0xBBGGRR (BGR, not RGB) packed ints;
     applied across every instruction in the block's range so the whole
     marked region is visually distinct, while the comment itself is only
@@ -4504,13 +5412,18 @@ def _apply_cfg_trace_and_refresh(config, items, jump_patches=None, start_ea=None
                 dead_insn_eas.update(item.insn_eas)
         for ea in sorted(dead_insn_eas):
             try:
-                _patch_nop_instruction(ea)
+                size = _patch_nop_instruction(ea)
+                if touched_ranges is not None:
+                    touched_ranges.append((ea, ea + size))
             except Exception as exc:
                 patch_log.append("Failed to NOP dead instruction at %#010x: %s" % (ea, exc))
         for jp in jump_patches:
             try:
-                ok, reason = _patch_jcc_to_real_target(jp.jcc_ea, jp.real_target_ea, jp.role_of_real)
-                if not ok:
+                ok, reason, size = _patch_jcc_to_real_target(jp.jcc_ea, jp.real_target_ea, jp.role_of_real)
+                if ok:
+                    if touched_ranges is not None:
+                        touched_ranges.append((jp.jcc_ea, jp.jcc_ea + size))
+                else:
                     patch_log.append("Failed to patch jump at %#010x: %s" % (jp.jcc_ea, reason))
             except Exception as exc:
                 patch_log.append("Failed to patch jump at %#010x: %s" % (jp.jcc_ea, exc))
@@ -4594,6 +5507,15 @@ class CfgTraceGraphView(ida_graph.GraphViewer):
     def OnHint(self, node_id):
         _label, _color, ea = self[node_id]
         block = self.runner.visited.get(ea) or self.runner.dead_blocks.get(ea)
+        if block is None:
+            # Not real/dead - check unresolved too (the marking-only fetch
+            # there often has a real BlockInfo available), so hovering an
+            # UNRESOLVED node isn't silently less informative than the
+            # other two verdicts.
+            for item in self.runner.unresolved:
+                if item.get("ea") == ea or item.get("anchor_ea") == ea:
+                    block = item.get("block")
+                    break
         if block is not None and block.insn_eas:
             try:
                 return render_block_text(block.insn_eas)
@@ -4608,6 +5530,20 @@ class CfgTraceGraphView(ida_graph.GraphViewer):
         except Exception:
             pass
         return True
+
+    def OnClose(self):
+        # Without this, closing the graph tab by hand (the 'x' on the
+        # widget, right-click Close, etc.) never told the plugin - it
+        # kept the now-defunct CfgTraceGraphView in _open_graphs forever
+        # (only pruned on plugin term()/IDA close), an unbounded leak
+        # across a long session with many traces. Mirrors the .finished
+        # signal cleanup _track_dialog already does for Qt dialogs.
+        plugin = LLMExplainerPlugin.instance
+        if plugin is not None:
+            try:
+                plugin._open_graphs.remove(self)
+            except ValueError:
+                pass
 
 
 class CfgTraceDialog(QtWidgets.QDialog):
@@ -4631,6 +5567,8 @@ class CfgTraceDialog(QtWidgets.QDialog):
         self.graph_view = None
         self._log_lines_since_pump = 0
         self._last_graph_refresh_ts = 0.0
+        self._refreshing_graph = False
+        self._reasoning_log_dialog = None
 
         self.setWindowTitle("%s - Trace/Recover CFG" % PLUGIN_NAME)
         self.resize(760, 560)
@@ -4679,6 +5617,10 @@ class CfgTraceDialog(QtWidgets.QDialog):
         )
         layout.addWidget(self.show_graph_check)
 
+        self.cache_status_label = QtWidgets.QLabel("")
+        self.cache_status_label.setWordWrap(True)
+        layout.addWidget(self.cache_status_label)
+
         self.confirm_status_label = QtWidgets.QLabel("")
         palette = self.confirm_status_label.palette()
         palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#a33"))
@@ -4687,6 +5629,21 @@ class CfgTraceDialog(QtWidgets.QDialog):
         layout.addStretch(1)
 
         button_row = QtWidgets.QHBoxLayout()
+        self.load_cached_button = QtWidgets.QPushButton("Load Cached Result")
+        self.load_cached_button.setToolTip(
+            "Skips straight to the review screen using the last trace result for this "
+            "exact address, if one is still cached from earlier this IDA session - no "
+            "re-tracing, no LLM calls. The cache reflects the database as it was at "
+            "capture time; if you've since patched or modified this address, re-trace "
+            "instead (accepting always re-verifies fresh bytes before writing regardless)."
+        )
+        self.load_cached_button.setEnabled(False)
+        self.load_cached_button.clicked.connect(self._on_load_cached_clicked)
+        button_row.addWidget(self.load_cached_button)
+        self.undo_patch_button = QtWidgets.QPushButton("Undo Patches")
+        self.undo_patch_button.setEnabled(False)
+        self.undo_patch_button.clicked.connect(self._on_undo_patch_clicked)
+        button_row.addWidget(self.undo_patch_button)
         button_row.addStretch(1)
         self.start_button = QtWidgets.QPushButton("Start")
         self.start_button.clicked.connect(self._on_start_clicked)
@@ -4697,6 +5654,118 @@ class CfgTraceDialog(QtWidgets.QDialog):
         layout.addLayout(button_row)
 
         self.stack.addWidget(page)
+        self.addr_edit.textChanged.connect(self._update_cache_status)
+        self.addr_edit.textChanged.connect(self._update_undo_status)
+        self._update_cache_status()
+        self._update_undo_status()
+
+    def _parse_addr_field(self):
+        """Returns an int ea, or None if the address field's text doesn't
+        parse - never raises, never touches the database (unlike
+        _on_start_clicked's fuller validation, this just needs to answer
+        "is there a cache entry for whatever's currently typed", re-run on
+        every keystroke).
+        """
+        text = self.addr_edit.text().strip()
+        for base in (0, 16):
+            try:
+                ea = int(text, base)
+                return ea if ea != idaapi.BADADDR else None
+            except ValueError:
+                continue
+        return None
+
+    def _update_cache_status(self, *_args):
+        plugin = LLMExplainerPlugin.instance
+        ea = self._parse_addr_field()
+        cached = plugin.get_cached_cfg_trace_result(ea) if plugin is not None and ea is not None else None
+        if cached is None:
+            self.cache_status_label.setText("")
+            self.load_cached_button.setEnabled(False)
+            return
+        real_n = sum(1 for b in cached.result.blocks if b.verdict == "real")
+        dead_n = sum(1 for b in cached.result.blocks if b.verdict == "dead")
+        unresolved_n = sum(1 for b in cached.result.blocks if b.verdict == "unresolved")
+        age_s = time.time() - cached.timestamp
+        age_text = (
+            "%d second(s) ago" % age_s if age_s < 60
+            else "%d minute(s) ago" % (age_s // 60) if age_s < 3600
+            else "%d hour(s) ago" % (age_s // 3600)
+        )
+        self.cache_status_label.setText(
+            "Cached result available for this address (%s): %d real, %d dead, %d unresolved. "
+            "Load it to review without re-tracing, or click Start to re-trace from scratch "
+            "(replaces the cached result once finished)."
+            % (age_text, real_n, dead_n, unresolved_n)
+        )
+        self.load_cached_button.setEnabled(True)
+
+    def _on_load_cached_clicked(self):
+        plugin = LLMExplainerPlugin.instance
+        ea = self._parse_addr_field()
+        cached = plugin.get_cached_cfg_trace_result(ea) if plugin is not None and ea is not None else None
+        if cached is None:
+            return
+        self.start_ea = ea
+        self.runner = cached.runner
+        self.result = cached.result
+        self.log_edit.clear()
+        self.log_edit.appendPlainText("\n".join(cached.runner.trace_log))
+        self._populate_review(cached.result)
+        self.stack.setCurrentIndex(2)
+
+    def _update_undo_status(self, *_args):
+        plugin = LLMExplainerPlugin.instance
+        ea = self._parse_addr_field()
+        applied = plugin.get_applied_cfg_patch(ea) if plugin is not None and ea is not None else None
+        if applied is None:
+            self.undo_patch_button.setEnabled(False)
+            self.undo_patch_button.setToolTip("")
+            return
+        total_bytes = sum(end - start for start, end in applied.touched_ranges)
+        mode_label = "Patch in place" if applied.mode == "patch_in_place" else "Rebuild linear"
+        self.undo_patch_button.setEnabled(True)
+        self.undo_patch_button.setToolTip(
+            "Reverts the %d byte(s) this plugin's \"%s\" patch touched here back to their "
+            "original values, using IDA's own recorded pre-patch bytes (same effect as "
+            "Edit > Patches > ..., but scoped to exactly this patch - nothing else this "
+            "trace didn't itself write is touched). If you've since re-patched this address "
+            "some other way, only the most recently accepted patch's own ranges are known "
+            "here and would be reverted."
+            % (total_bytes, mode_label)
+        )
+
+    def _on_undo_patch_clicked(self):
+        plugin = LLMExplainerPlugin.instance
+        ea = self._parse_addr_field()
+        applied = plugin.get_applied_cfg_patch(ea) if plugin is not None and ea is not None else None
+        if applied is None:
+            return
+        total_bytes = sum(end - start for start, end in applied.touched_ranges)
+        mode_label = "Patch in place" if applied.mode == "patch_in_place" else "Rebuild linear"
+        answer = QtWidgets.QMessageBox.question(
+            self, "Undo Patches - %s" % PLUGIN_NAME,
+            "This will revert %d byte(s) across %d range(s) back to their original values "
+            "(from the \"%s\" patch accepted earlier at %#010x), using IDA's own recorded "
+            "pre-patch bytes. This does not touch the color/comment marking, and does not "
+            "remove any function definition that patch may have created. Continue?"
+            % (total_bytes, len(applied.touched_ranges), mode_label, ea),
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        result_holder = {}
+
+        def _do_undo():
+            result_holder["count"] = _undo_applied_cfg_patch(applied)
+            return 1
+
+        ida_kernwin.execute_sync(_do_undo, ida_kernwin.MFF_WRITE)
+        plugin.forget_applied_cfg_patch(ea)
+        self._update_undo_status()
+        QtWidgets.QMessageBox.information(
+            self, "Undo Patches - %s" % PLUGIN_NAME,
+            "Reverted %d byte(s)." % result_holder.get("count", 0),
+        )
 
     def _on_start_clicked(self):
         text = self.addr_edit.text().strip()
@@ -4754,6 +5823,30 @@ class CfgTraceDialog(QtWidgets.QDialog):
             self._ensure_graph_view()
         self.runner.start(self._on_trace_finished)
 
+    def _show_reasoning_log(self):
+        if self.runner is None:
+            return
+        # Non-modal (so the review table stays usable alongside it) - kept
+        # as an instance attribute rather than a bare local, since nothing
+        # else would otherwise hold a Python reference to it and it could
+        # get garbage-collected (and the window closed from under the
+        # user) as soon as this method returns.
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Trace Reasoning - %s" % PLUGIN_NAME)
+        dlg.resize(720, 520)
+        dlg.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        text_edit = QtWidgets.QPlainTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setFont(QtGui.QFont("Consolas", 9))
+        text_edit.setPlainText("\n".join(self.runner.trace_log))
+        layout.addWidget(text_edit, 1)
+        close_button = QtWidgets.QPushButton("Close")
+        close_button.clicked.connect(dlg.close)
+        layout.addWidget(close_button)
+        self._reasoning_log_dialog = dlg
+        dlg.show()
+
     def _ensure_graph_view(self):
         if self.runner is None:
             return
@@ -4764,14 +5857,21 @@ class CfgTraceDialog(QtWidgets.QDialog):
             title = "CFG Trace - %#010x" % self.start_ea
             self.graph_view = plugin.open_cfg_trace_graph(self.runner, title)
         else:
+            # Show() returns a bool - a manually-closed graph can come
+            # back False without raising at all, so checking only for an
+            # exception here missed that case and the button would
+            # appear to do nothing.
+            reshown = False
             try:
-                self.graph_view.Show()
+                reshown = bool(self.graph_view.Show())
             except Exception:
+                reshown = False
+            if not reshown:
                 self.graph_view = plugin.open_cfg_trace_graph(self.runner, "CFG Trace - %#010x" % self.start_ea)
         self._refresh_graph_view(force=True)
 
     def _refresh_graph_view(self, force=False):
-        if self.graph_view is None:
+        if self.graph_view is None or self._refreshing_graph:
             return
         # A graph Refresh() means a full Clear() + rebuild + IDA's own
         # re-layout of the whole graph - much more expensive than a log
@@ -4786,6 +5886,18 @@ class CfgTraceDialog(QtWidgets.QDialog):
         if not force and (now - self._last_graph_refresh_ts) < 0.5:
             return
         self._last_graph_refresh_ts = now
+        # processEvents() below can dispatch a queued click (e.g. "Show
+        # Graph" clicked again while this call is still on the stack),
+        # which would otherwise re-enter this same method - guard against
+        # that rather than risk nested Clear()/rebuild calls stepping on
+        # each other.
+        self._refreshing_graph = True
+        try:
+            self._do_refresh_graph_view()
+        finally:
+            self._refreshing_graph = False
+
+    def _do_refresh_graph_view(self):
         try:
             self.graph_view.Refresh()
         except Exception:
@@ -4844,6 +5956,12 @@ class CfgTraceDialog(QtWidgets.QDialog):
         self._refresh_graph_view(force=True)
         self._populate_review(result)
         self.stack.setCurrentIndex(2)
+        plugin = LLMExplainerPlugin.instance
+        if plugin is not None and self.runner is not None:
+            # Cached only on a natural stop (fully explored or block-cap
+            # partial) - not on user Cancel, which can leave the runner
+            # mid-decision-point in a less meaningful state to revisit.
+            plugin.cache_cfg_trace_result(self.start_ea, self.runner, result)
 
     # -- phase 3: review ----------------------------------------------------
 
@@ -4859,27 +5977,67 @@ class CfgTraceDialog(QtWidgets.QDialog):
         self.review_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.review_table, 1)
 
-        self.patch_bytes_check = QtWidgets.QCheckBox(
-            "Also patch bytes (redirect confirmed opaque-predicate jumps to their real "
-            "target, NOP dead code)"
+        mode_box = QtWidgets.QGroupBox("On Accept:")
+        mode_layout = QtWidgets.QVBoxLayout(mode_box)
+        self.mode_group = QtWidgets.QButtonGroup(self)
+
+        self.mode_mark_only = QtWidgets.QRadioButton("Mark only (color + comment, no bytes changed)")
+        self.mode_mark_only.setChecked(True)
+        self.mode_group.addButton(self.mode_mark_only)
+        mode_layout.addWidget(self.mode_mark_only)
+
+        self.mode_patch_in_place = QtWidgets.QRadioButton(
+            "Patch in place (redirect confirmed opaque-predicate jumps to their real target, "
+            "NOP dead code)"
         )
-        self.patch_bytes_check.setChecked(False)
-        self.patch_bytes_check.setToolTip(
-            "Unlike the color/comment marking above, this changes actual code bytes, not "
-            "just IDB metadata (though it is revertible via Edit > Patches). Only applies "
-            "to conditional_branch blocks where BOTH successors were fully and oppositely "
-            "decided (one real, one dead) AND both corresponding rows are checked above - "
-            "never to genuine data-dependent branches (both sides real) or anything "
-            "touching an unresolved verdict. You will be asked to confirm the exact count "
-            "before anything is patched."
+        self.mode_patch_in_place.setToolTip(
+            "Unlike Mark only, this changes actual code bytes, not just IDB metadata (though "
+            "it is revertible via Edit > Patches). Only redirects a conditional_branch block "
+            "where BOTH successors were fully and oppositely decided (one real, one dead) AND "
+            "both corresponding rows are checked above - never a genuine data-dependent branch "
+            "(both sides real) or anything touching an unresolved verdict. You will be asked to "
+            "confirm the exact count before anything is patched."
         )
-        self.patch_bytes_check.toggled.connect(self._on_patch_bytes_toggled)
-        layout.addWidget(self.patch_bytes_check)
+        self.mode_group.addButton(self.mode_patch_in_place)
+        mode_layout.addWidget(self.mode_patch_in_place)
+
+        self.mode_rebuild_linear = QtWidgets.QRadioButton(
+            "Rebuild linear (replace the entry point with a straight-line rebuild of the real "
+            "code only)"
+        )
+        self.mode_rebuild_linear.setToolTip(
+            "Different from the other two options: leaves every original byte in the binary "
+            "untouched EXCEPT the function's own entry point through the end of the rebuilt "
+            "code. Every confirmed-real block (not subject to the checkboxes above, which only "
+            "control coloring - a partial rebuild missing some of the real control flow would "
+            "not be safe) is concatenated into one straight-line sequence with every jump/call "
+            "re-encoded explicitly, written starting exactly at the entry point, using space up "
+            "to the furthest address any block this trace examined reached - crossing ordinary "
+            "unexplored gaps too, unless a gap byte belongs to a different existing function or "
+            "is referenced from outside this trace. A block using RIP-"
+            "relative addressing or a live multi-case indirect dispatch cannot be safely moved "
+            "and is left at its original address untouched, PROVIDED that doesn't overlap the "
+            "rebuilt range - otherwise the whole rebuild is refused rather than guessed at, "
+            "same for the entry block itself and if the rebuild simply doesn't fit."
+        )
+        self.mode_group.addButton(self.mode_rebuild_linear)
+        mode_layout.addWidget(self.mode_rebuild_linear)
+
+        self.mode_group.buttonToggled.connect(self._on_patch_mode_changed)
+        layout.addWidget(mode_box)
 
         button_row = QtWidgets.QHBoxLayout()
         self.review_show_graph_button = QtWidgets.QPushButton("Show Graph")
         self.review_show_graph_button.clicked.connect(self._ensure_graph_view)
         button_row.addWidget(self.review_show_graph_button)
+        self.review_show_log_button = QtWidgets.QPushButton("View Reasoning Log")
+        self.review_show_log_button.setToolTip(
+            "Opens the full trace transcript in a separate window - every decision, "
+            "symbolic/LLM, in order. Works the same whether this result just finished "
+            "or was loaded from the cache."
+        )
+        self.review_show_log_button.clicked.connect(self._show_reasoning_log)
+        button_row.addWidget(self.review_show_log_button)
         button_row.addStretch(1)
         self.accept_button = QtWidgets.QPushButton("Accept && Mark Disassembly")
         self.accept_button.clicked.connect(self._on_accept)
@@ -4891,10 +6049,15 @@ class CfgTraceDialog(QtWidgets.QDialog):
 
         self.stack.addWidget(page)
 
-    def _on_patch_bytes_toggled(self, checked):
-        self.accept_button.setText(
-            "Accept && Mark/Patch Disassembly" if checked else "Accept && Mark Disassembly"
-        )
+    def _on_patch_mode_changed(self, button, checked):
+        if not checked:
+            return
+        if button is self.mode_rebuild_linear:
+            self.accept_button.setText("Accept && Rebuild Linear")
+        elif button is self.mode_patch_in_place:
+            self.accept_button.setText("Accept && Mark/Patch Disassembly")
+        else:
+            self.accept_button.setText("Accept && Mark Disassembly")
 
     def _populate_review(self, result):
         status = "Partial (block cap reached)" if result.partial else "Complete"
@@ -4952,8 +6115,12 @@ class CfgTraceDialog(QtWidgets.QDialog):
             self.close()
             return
 
+        if self.mode_rebuild_linear.isChecked():
+            self._on_accept_rebuild_linear(items)
+            return
+
         jump_patches = None
-        if self.patch_bytes_check.isChecked():
+        if self.mode_patch_in_place.isChecked():
             # Only ever patch a jump when BOTH of its successors' rows are
             # checked - if the user unchecked either side, treat that jcc
             # as "not confirmed enough to touch bytes for", same as if
@@ -4978,10 +6145,66 @@ class CfgTraceDialog(QtWidgets.QDialog):
             if answer != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
 
+        touched_ranges = []
         ida_kernwin.execute_sync(
-            functools.partial(_apply_cfg_trace_and_refresh, self.config, items, jump_patches, self.start_ea),
+            functools.partial(
+                _apply_cfg_trace_and_refresh, self.config, items, jump_patches, self.start_ea, touched_ranges,
+            ),
             ida_kernwin.MFF_WRITE,
         )
+        plugin = LLMExplainerPlugin.instance
+        if plugin is not None:
+            plugin.record_applied_cfg_patch(self.start_ea, "patch_in_place", touched_ranges)
+        self.accept_button.setEnabled(False)
+        self.close()
+
+    def _on_accept_rebuild_linear(self, items):
+        if self.runner is None:
+            self.close()
+            return
+        plan_holder = {}
+
+        def _compute():
+            plan_holder["plan"] = _gather_linear_rebuild_plan(self.runner)
+            return 1
+
+        ida_kernwin.execute_sync(_compute, ida_kernwin.MFF_WRITE)
+        plan = plan_holder.get("plan")
+        if plan is None or plan.error is not None:
+            QtWidgets.QMessageBox.warning(
+                self, "Rebuild Linear - %s" % PLUGIN_NAME,
+                "Cannot rebuild: %s" % (plan.error if plan is not None else "internal error"),
+            )
+            return
+
+        anchored_note = (
+            "%d block(s) could not be safely relocated (RIP-relative addressing or a live "
+            "multi-case dispatch) and were left at their original address untouched.\n\n"
+            % plan.anchored_count
+            if plan.anchored_count else ""
+        )
+        answer = QtWidgets.QMessageBox.question(
+            self, "Rebuild Linear - %s" % PLUGIN_NAME,
+            "This will replace %d byte(s) starting at the function's entry point (%#010x) with "
+            "a straight-line rebuild of %d confirmed-real block(s). %s"
+            "Nothing else in the binary is modified - every other address (dead code, and any "
+            "block left untouched above) keeps its exact original bytes.\n\n"
+            "This is revertible via Edit > Patches > ... in IDA if needed. Continue?"
+            % (len(plan.code), plan.entry_ea, plan.relocated_count, anchored_note),
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        ida_kernwin.execute_sync(
+            functools.partial(_apply_cfg_trace_and_refresh, self.config, items, None, self.start_ea),
+            ida_kernwin.MFF_WRITE,
+        )
+        ida_kernwin.execute_sync(functools.partial(_apply_linear_rebuild, plan), ida_kernwin.MFF_WRITE)
+        plugin = LLMExplainerPlugin.instance
+        if plugin is not None:
+            plugin.record_applied_cfg_patch(
+                self.start_ea, "rebuild_linear", [(plan.entry_ea, plan.entry_ea + len(plan.code))],
+            )
         self.accept_button.setEnabled(False)
         self.close()
 
@@ -5126,10 +6349,11 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         "batch-explain multiple functions. In the disassembly view, "
         "'Trace/Recover CFG...' asks the LLM to walk an obfuscated "
         "function's real control flow branch by branch and mark real/dead "
-        "code (color + comment by default; an opt-in 'Also patch bytes' "
-        "option can additionally NOP dead code and redirect confirmed "
-        "opaque-predicate jumps). Edit > Plugins > LLM Explainer opens "
-        "settings."
+        "code (color + comment by default; 'Patch in place' can "
+        "additionally NOP dead code and redirect confirmed opaque-"
+        "predicate jumps, or 'Rebuild linear' replaces the entry point "
+        "with a straight-line rebuild of just the real code). "
+        "Edit > Plugins > LLM Explainer opens settings."
     )
     wanted_name = PLUGIN_NAME
     wanted_hotkey = ""
@@ -5141,6 +6365,8 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         self.config = PluginConfig.load()
         self._open_dialogs = []
         self._open_graphs = []
+        self._trace_cache = OrderedDict()  # start_ea -> _CachedCfgTrace, oldest-first
+        self._applied_cfg_patches = OrderedDict()  # start_ea -> _AppliedCfgPatch, oldest-first
         self._action_handler = ExplainActionHandler()
         self._recursive_action_handler = ExplainRecursiveActionHandler()
         self._batch_action_handler = BatchActionHandler()
@@ -5249,6 +6475,8 @@ class LLMExplainerPlugin(idaapi.plugin_t):
             except Exception:
                 pass
         self._open_graphs = []
+        self._trace_cache = OrderedDict()
+        self._applied_cfg_patches = OrderedDict()
         try:
             self._popup_hooks.unhook()
         except Exception:
@@ -5296,6 +6524,46 @@ class LLMExplainerPlugin(idaapi.plugin_t):
     def open_cfg_trace_dialog(self, start_ea):
         dlg = CfgTraceDialog(self.config, start_ea)
         return self._track_dialog(dlg)
+
+    _TRACE_CACHE_MAX = 20
+
+    def cache_cfg_trace_result(self, start_ea, runner, result):
+        self._trace_cache[start_ea] = _CachedCfgTrace(runner=runner, result=result, timestamp=time.time())
+        self._trace_cache.move_to_end(start_ea)
+        while len(self._trace_cache) > self._TRACE_CACHE_MAX:
+            self._trace_cache.popitem(last=False)  # evict oldest
+
+    def get_cached_cfg_trace_result(self, start_ea):
+        cached = self._trace_cache.get(start_ea)
+        if cached is not None:
+            self._trace_cache.move_to_end(start_ea)  # LRU-ish: recently viewed survives longer
+        return cached
+
+    def record_applied_cfg_patch(self, start_ea, mode, touched_ranges):
+        """touched_ranges is only ever recorded when non-empty (Mark only
+        never calls this at all - nothing was written). A second Accept
+        at the same address REPLACES the previous record rather than
+        merging with it - Undo then only reverts the most recent
+        patch's own ranges, not anything an earlier one at this same
+        address may have separately touched.
+        """
+        if not touched_ranges:
+            return
+        self._applied_cfg_patches[start_ea] = _AppliedCfgPatch(
+            mode=mode, touched_ranges=list(touched_ranges), timestamp=time.time(),
+        )
+        self._applied_cfg_patches.move_to_end(start_ea)
+        while len(self._applied_cfg_patches) > self._TRACE_CACHE_MAX:
+            self._applied_cfg_patches.popitem(last=False)
+
+    def get_applied_cfg_patch(self, start_ea):
+        applied = self._applied_cfg_patches.get(start_ea)
+        if applied is not None:
+            self._applied_cfg_patches.move_to_end(start_ea)
+        return applied
+
+    def forget_applied_cfg_patch(self, start_ea):
+        self._applied_cfg_patches.pop(start_ea, None)
 
     def open_cfg_trace_graph(self, runner, title):
         """Kept alive independently of whichever CfgTraceDialog created

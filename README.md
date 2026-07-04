@@ -71,12 +71,17 @@ checkbox, editable before anything is written.
   (a native IDA graph, colored the same green/red/amber as the eventual disassembly marking,
   filling in node by node as the trace runs — double-click a node to jump there); once the
   trace finishes (or a configurable block-count safety cap is hit), a review table lets you
-  check/uncheck each decided block before Accept. By default Accept only colors the disassembly
-  and adds a comment — no byte patching. An opt-in **"Also patch bytes"** checkbox on the review
-  screen (unchecked by default, with a confirmation prompt) additionally NOPs out confirmed dead
-  code and redirects confirmed opaque-predicate jumps straight to their real target, so Hex-Rays
-  can decompile the recovered function cleanly — see [below](#patching-the-recovered-cfg) for
-  exactly what it does and does not touch.
+  check/uncheck each decided block before Accept, with a **"View Reasoning Log"** button to see
+  the full transcript in a separate window. By default Accept only colors the disassembly and
+  adds a comment — no byte patching. **"Patch in place"** additionally NOPs out confirmed dead
+  code and redirects confirmed opaque-predicate jumps straight to their real target; **"Rebuild
+  linear"** instead replaces the entry point with a freshly concatenated straight-line rebuild of
+  just the real blocks — see [below](#patching-the-recovered-cfg) for exactly what each mode does
+  and does not touch. The finished result is also cached in memory for the rest of the IDA
+  session: reopening **Trace/Recover CFG...** on the same address offers a **"Load Cached
+  Result"** button that jumps straight to the review screen — no re-tracing, no LLM calls — so
+  you can look at a result again later and decide then whether to patch it in. If you do patch
+  it in, that same screen also offers **"Undo Patches"** to revert exactly those bytes.
 
 ![Trace/Recover CFG live view: the recovered control-flow graph, colored real/dead, next to the live transcript explaining each block's verdict](tracer.png)
 
@@ -188,16 +193,31 @@ mode writes to the database unattended.
    explicitly accept in step 4.
 4. Once the worklist empties (or the "Max CFG trace blocks" cap is hit, producing a partial
    result), review the table of every decided/flagged block — verdict REAL/DEAD/UNRESOLVED, with
-   a reason (rows resolved automatically are prefixed `[symbolic]`) — check/uncheck rows, and
-   click **Accept & Mark Disassembly**. This only colors the affected instructions and adds a
-   one-line comment on each block's first instruction; it never patches bytes, unless you've
-   checked "Also patch bytes" (see below).
+   a reason (rows resolved automatically are prefixed `[symbolic]`) — check/uncheck rows, pick an
+   "On Accept" mode (Mark only/Patch in place/Rebuild linear — see below), and click Accept. Mark
+   only just colors the affected instructions and adds a one-line comment on each block's first
+   instruction; it never patches bytes.
+5. The finished result stays cached in memory (this IDA session only) by its exact start
+   address. Reopening **Trace/Recover CFG...** on the same address shows a **"Load Cached
+   Result"** button on the first screen — use it to jump straight to the review table (and the
+   reasoning log) without re-tracing, then decide then whether to Accept. Starting a fresh trace
+   instead always re-traces from scratch and replaces the cached result once it finishes.
+6. If **Patch in place** or **Rebuild linear** was accepted, that same first screen also shows an
+   **"Undo Patches"** button (also cached in memory, this session only) — reverts exactly the
+   bytes that patch touched back to their original values, using IDA's own recorded pre-patch
+   bytes (the same mechanism behind **Edit → Patches → ...**, just scoped to precisely this
+   trace's own changes rather than everything in the database). It does not undo the
+   color/comment marking or remove any function definition the patch created.
 
 ### Patching the recovered CFG
 
-The review screen also has an **"Also patch bytes"** checkbox (unchecked by default, with a
-confirmation prompt showing exact counts before anything is touched). When checked, **Accept**
-additionally:
+The review screen has three mutually-exclusive **"On Accept"** modes (Mark only, selected by
+default):
+
+**Mark only** — color + comment the disassembly, exactly as described above. No bytes changed.
+
+**Patch in place** — additionally, with a confirmation prompt showing exact counts before
+anything is touched:
 
 - **NOPs out every checked DEAD instruction's bytes** (`0x90` per byte — safe for any
   instruction length, no multi-byte NOP encoding needed).
@@ -223,6 +243,46 @@ claimed by a real, live instruction. This changes actual code bytes, not just ID
 colors/comments — it's revertible via IDA's own **Edit → Patches** menu, but review the counts
 in the confirmation prompt before proceeding.
 
+**Rebuild linear** — a fundamentally different approach: instead of neutering dead paths in
+place, every confirmed-real block (the trace's complete, closed real set — not subject to the
+review checkboxes, since a rebuild missing part of the real control flow wouldn't be safe) is
+concatenated into one straight-line sequence and written starting exactly at the function's
+entry point. Every jump/call is re-encoded explicitly (a `Jcc`+`JMP` pair for a genuine
+data-dependent branch, a plain `JMP` for a resolved opaque predicate or single-case dispatch, a
+recomputed direct `call` for anything that calls out) rather than relying on layout adjacency, so
+correctness never depends on how blocks happen to be ordered. **Nothing else in the binary is
+touched** — every other address (dead code, and the block below) keeps its exact original bytes;
+only `[entry point, entry point + rebuilt size)` changes. This intentionally does *not* relocate
+code to a new segment: a freshly-added IDA segment has no backing in the actual executable file
+or process memory, so a jump to one wouldn't go anywhere real at runtime — the rebuilt code has
+to fit starting at the entry point instead. That available space isn't just the trace's own
+real/dead bytes packed with zero gaps (a real obfuscated function's blocks are rarely that
+tightly arranged) — it also crosses ordinary unexplored gaps between them, up to the furthest
+address any block the trace examined (real, dead, or unresolved) reached, as long as each gap
+byte/item isn't already claimed by a *different*, already-recognized IDA function and has no
+incoming xref (code or data) from an address genuinely outside every block this trace ever
+examined in any verdict (real, dead, *or* unresolved) — either of those stops the search right
+there rather than risk eating into something else. That last part matters for flattening-style
+obfuscation specifically: decoy/junk blocks routinely cross-reference *each other* without any of
+them ever being individually walked as real or dead (nothing reachable ever led the trace to
+them), so an xref from another address the trace simply never classified is not, by itself,
+evidence of anything external — only an xref from truly outside the whole span this trace looked
+at is treated that way. An UNRESOLVED block's own range is always excluded from the available
+space outright, never crossed.
+
+A block cannot always be safely relocated: one using RIP-relative addressing (a copy elsewhere
+would compute the wrong address, since RIP-relative displacements are relative to the next
+instruction, which moves) or an indirect jump with more than one genuinely real case (rewriting a
+live jump table is out of scope) is left at its original address, untouched, rather than
+guessed at — **provided** that address, and every relocated block's reference to it, falls
+outside the rebuilt range. If the entry block itself can't be relocated, if an unrelocatable
+block or its target *does* fall inside the rebuilt range, or if the rebuild simply doesn't fit in
+the available space, the whole operation is refused with a specific reason rather than producing
+a partially-correct result — nothing is written in that case. A "doesn't fit" refusal names the
+exact address the available-space search stopped at and why (hit a different function, hit
+something referenced from outside this trace, or simply reached the furthest address the trace
+ever explored), so it can actually be diagnosed rather than just reporting two byte counts.
+
 Blocks the model never gave a verdict for, addresses it invented outside the actual candidates,
 and conflicting REAL/DEAD verdicts for the same address reached from different paths are all
 surfaced as UNRESOLVED rather than silently resolved one way or the other, so you can just
@@ -242,6 +302,18 @@ again from a *different* real block later in the trace — the loop-revisit patt
 successors previously marked dead are automatically un-marked and moved to UNRESOLVED for
 review, rather than staying permanently (and possibly wrongly) dead.
 
+**Overlapping instructions** are refused rather than silently walked over. Obfuscators
+sometimes rely on the same bytes decoding differently depending on where you start reading them
+— a later-discovered target can land strictly inside an instruction a different block earlier
+in the *same* trace already fixed up in the database. Naively re-walking from that address would
+call IDA's own `del_items`, which deletes the *whole* item covering any address passed to it —
+silently destroying the earlier block's already-established boundary, even though that earlier
+block might already be confirmed real. The trace tracks every instruction address it has claimed
+across the whole run and refuses to touch the database at a strict-overlap address at all,
+flagging it UNRESOLVED for manual review instead of guessing which interpretation of the
+overlapping bytes is the real one. Re-walking from the *exact* same start address (an ordinary
+merge point, not an overlap) is unaffected.
+
 **Constant-propagation pass limitations** (falls back to the LLM for these, same as if the
 feature were off): x86/x64 only; indexed/scaled memory addressing (`[rcx+rdx*4]`,
 `[rax*8+table]`) is supported for reads but never round-trip-tracked through writes; a `call`'s
@@ -251,6 +323,39 @@ runtime data (same as an incoming argument), which resolves an ordinary
 through a call to derive a fixed value; only
 `mov`/`movzx`/`movsx(d)`/`lea`/`add`/`sub`/`and`/`or`/`xor`/`not`/`neg`/`inc`/`dec`/`shl`/`shr`/
 `sar`/`cmp`/`test`/`push`/`pop`/`nop` are modeled — anything else resets tracking for that path.
+`and`/`or`/`xor`/`test` additionally resolve unsigned and signed relational jumps
+(`ja`/`jae`/`jb`/`jbe`/`jg`/`jge`/`jl`/`jle`, `jo`/`jno`, and aliases) directly from their result,
+since those four instructions architecturally guarantee the overflow and carry flags are cleared
+— `add`/`sub`/shifts/`neg` do not get this, since their overflow/carry genuinely depends on the
+operands. `inc`/`dec` are a partial exception: real x86 never touches the carry flag for `inc`/
+`dec` at all (only the overflow/zero/sign flags change), so a carry-flag guarantee from an
+earlier `and`/`or`/`xor`/`test` survives an `inc`/`dec` in between, while the overflow-flag
+guarantee correctly does not (it genuinely can be set at the signed range boundary). `jae`/`jnb`/
+`jnc`, `jb`/`jc`/`jnae`, and `jo`/`jno` resolve from their single relevant flag guarantee alone —
+each of those conditions is purely "that one flag is 0" or "is 1", so the outcome is fixed
+regardless of whether the actual result is even known; `ja`/`jbe` and their aliases also depend
+on the zero flag, so they still need a known value. `jp`/`jpe`/`jnp`/`jpo` (parity) resolve
+directly from a known concrete result's low byte, the same way `jz`/`js` already do, needing no
+flag guarantee at all. A shift is masked to the count real x86 actually uses before doing
+anything else — 5 bits for an 8/16/32-bit operand, 6 bits only for a 64-bit one (so e.g.
+`shl eax, 32` is a genuine no-op, not "shift by 32") — and a masked count of `0` is treated as the
+complete no-op it is on real hardware (the Intel SDM: "if the count is 0, the flags are not
+affected") rather than resetting tracking — an obfuscator inserting one specifically to break
+naive flag tracking (e.g. `or reg, 0` then `shl reg, 0` before a relational jump) does not get
+away with it.
+
+**Per-edge value narrowing**: a very common obfuscation trick chains several condition codes
+back to back, separated only by flag-preserving junk (`nop`, a self-move, etc.), so they all
+actually test the *same* underlying result rather than being independent checks. The first test
+in such a chain is often a genuine data-dependent bit check (e.g. `and reg, 1` on a caller-
+supplied value, then `jz`) — correctly real on both sides, since the caller's input decides which
+way it goes. But having taken the "nonzero" side of a *single-bit* `and reg, mask` test, `reg` is
+now provably exactly `mask` on that specific path — not just "some unknown nonzero value" —
+regardless of what the original input actually was. The pass carries this forward: a subsequent
+relational jump reached via flag-preserving instructions only, with no intervening comparison,
+resolves against that narrowed concrete value instead of continuing to treat it as external. This
+is deliberately narrow (one bit, `and` specifically, only through `jz`/`je`/`jnz`/`jne`) rather
+than a general value-range/constraint solver — anything wider still falls back to the LLM.
 Disable "Resolve CFG trace branches via constant propagation" in Settings to force every
 decision point through the LLM as before.
 
