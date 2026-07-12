@@ -251,6 +251,13 @@ DEFAULT_SYSTEM_PROMPT = (
     "and check it, not just the first or most obvious one - as one line "
     "per variable of the exact form\n"
     "SUGGESTED_VAR: <current_name> -> <new_name>\n"
+    "Likewise, if the pseudocode contains goto labels with default "
+    "compiler-generated names (e.g. LABEL_5) and you can tell what the "
+    "labelled code does (a retry point, a cleanup/error exit, the top of "
+    "a parse loop, ...), propose a rename for each such label as one line "
+    "per label of the exact form\n"
+    "SUGGESTED_LABEL: <current_label> -> <new_label>\n"
+    "e.g. SUGGESTED_LABEL: LABEL_5 -> cleanup_and_return\n"
     "3. If you actually examined the code of a CALLED function this "
     "conversation (because it was included up front, or you requested it "
     "with REQUEST_CODE), propose a rename for it - only that function, and "
@@ -322,7 +329,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "e.g. SUGGESTED_VAR_TYPE: v3 tagPOINT *\n\n"
     "Only propose something you are reasonably confident about from the "
     "code itself, never a guess. Steps 2 and 5 (SUGGESTED_SIGNATURE, "
-    "SUGGESTED_VAR, SUGGESTED_STRUCT, SUGGESTED_VAR_TYPE) require the "
+    "SUGGESTED_VAR, SUGGESTED_LABEL, SUGGESTED_STRUCT, SUGGESTED_VAR_TYPE) require the "
     "target function's own code to have been given as Hex-Rays "
     "pseudocode - skip them entirely when you were given plain "
     "disassembly instead. Steps 1, 3 and 4 (SUGGESTED_NAME, "
@@ -579,6 +586,7 @@ _REQUEST_CODE_RE = re.compile(r"(?im)^\s*REQUEST_CODE:\s*(.+?)\s*$")
 _SUGGESTED_NAME_RE = re.compile(r"(?im)^\s*SUGGESTED_NAME:\s*(.+?)\s*$")
 _SUGGESTED_SIGNATURE_RE = re.compile(r"(?im)^\s*SUGGESTED_SIGNATURE:\s*(.+?)\s*$")
 _SUGGESTED_VAR_RE = re.compile(r"(?im)^\s*SUGGESTED_VAR:\s*([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*)\s*$")
+_SUGGESTED_LABEL_RE = re.compile(r"(?im)^\s*SUGGESTED_LABEL:\s*([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*)\s*$")
 _SUGGESTED_CALLEE_NAME_RE = re.compile(
     r"(?im)^\s*SUGGESTED_CALLEE_NAME:\s*(.+?)\s*->\s*([A-Za-z_]\w*)\s*$"
 )
@@ -1003,6 +1011,87 @@ def _rename_lvars(func_ea, var_renames):
     return applied
 
 
+_DEFAULT_LABEL_RE = re.compile(r"(?i)^LABEL_(\d+)$")
+
+
+def _rename_user_labels(func_ea, label_renames):
+    """Rename Hex-Rays pseudocode goto labels via the user-labels store
+    (the same mechanism as the UI's right-click 'Rename label'): a
+    user_labels_t maps label NUMBER -> display name, persisted per
+    function. A default 'LABEL_5' is simply label number 5 with no user
+    entry, so the number is parsed straight out of the default name; a
+    label the user (or an earlier round) already renamed is matched by
+    looking its current name up in the existing user-label map.
+
+    Runs against the numbering of the decompilation the model saw, so the
+    caller must invoke this BEFORE anything that can change how the
+    function decompiles (retyping locals, changing the signature) -
+    those can renumber labels.
+    """
+    if not label_renames or ida_hexrays is None:
+        return
+    try:
+        hexrays_ready = ida_hexrays.init_hexrays_plugin()
+    except Exception:
+        hexrays_ready = False
+    if not hexrays_ready:
+        return
+    try:
+        labels = ida_hexrays.restore_user_labels(func_ea)
+        if labels is None:
+            labels = ida_hexrays.user_labels_new()
+        # Current name -> label number, for renaming already-renamed labels
+        # and for collision checks below.
+        existing = {}
+        it = ida_hexrays.user_labels_begin(labels)
+        end = ida_hexrays.user_labels_end(labels)
+        while it != end:
+            existing[ida_hexrays.user_labels_second(it)] = ida_hexrays.user_labels_first(it)
+            it = ida_hexrays.user_labels_next(it)
+    except Exception as exc:
+        ida_kernwin.msg("[%s] Failed to load user labels: %s\n" % (PLUGIN_NAME, exc))
+        return
+
+    taken = set(existing)
+    changed = False
+    for old_label, new_label in label_renames:
+        if old_label == new_label:
+            continue
+        number = existing.get(old_label)
+        if number is None:
+            match = _DEFAULT_LABEL_RE.match(old_label)
+            if match:
+                number = int(match.group(1))
+        if number is None:
+            ida_kernwin.msg(
+                "[%s] Skipping label rename '%s' -> '%s': not a default "
+                "LABEL_n name and no user label with that name exists.\n"
+                % (PLUGIN_NAME, old_label, new_label)
+            )
+            continue
+        desired = _dedupe_name(new_label, taken - {old_label})
+        try:
+            found = ida_hexrays.user_labels_find(labels, number)
+            if found != ida_hexrays.user_labels_end(labels):
+                ida_hexrays.user_labels_erase(labels, found)
+            ida_hexrays.user_labels_insert(labels, number, desired)
+        except Exception as exc:
+            ida_kernwin.msg(
+                "[%s] Failed to rename label '%s' -> '%s': %s\n"
+                % (PLUGIN_NAME, old_label, desired, exc)
+            )
+            continue
+        taken.discard(old_label)
+        taken.add(desired)
+        existing[desired] = number
+        changed = True
+    if changed:
+        try:
+            ida_hexrays.save_user_labels(func_ea, labels)
+        except Exception as exc:
+            ida_kernwin.msg("[%s] Failed to save user labels: %s\n" % (PLUGIN_NAME, exc))
+
+
 def _create_struct_type(decl_text):
     """Register a struct (or other UDT) declaration into the local types
     library via IDA's C declaration parser, e.g.
@@ -1075,7 +1164,7 @@ def _apply_var_types(func_ea, var_types):
 
 def _apply_suggestions_and_refresh(
     func_ea, comment, new_name=None, signature=None, var_renames=None, callee_renames=None,
-    struct_decl=None, var_types=None, global_renames=None,
+    struct_decl=None, var_types=None, global_renames=None, label_renames=None,
 ):
     # Struct creation must happen first: the signature and/or variable
     # types below may reference the new type by name, and need it to
@@ -1095,6 +1184,11 @@ def _apply_suggestions_and_refresh(
     # then retyping, avoids that: var_types is translated through
     # var_renames below so it looks up by whatever name is now current.
     applied_renames = _rename_lvars(func_ea, var_renames)
+    # Label renames also run before retyping/signature changes: label
+    # NUMBERS follow from how the function currently decompiles, and the
+    # numbers the model saw (via LABEL_n names) are only guaranteed valid
+    # until something below changes the decompilation.
+    _rename_user_labels(func_ea, label_renames)
     translated_var_types = var_types
     if var_types and applied_renames:
         # Translate through the names ACTUALLY applied (which may carry a
@@ -3470,7 +3564,7 @@ class LlamaStreamWorker(threading.Thread):
 
 ConversationResult = namedtuple("ConversationResult", [
     "text", "reasoning_text", "suggested_name", "suggested_signature",
-    "suggested_vars", "suggested_callee_renames", "suggested_struct",
+    "suggested_vars", "suggested_labels", "suggested_callee_renames", "suggested_struct",
     "suggested_var_types", "suggested_global_renames", "suggested_reanalyze",
     "root_is_pseudocode", "error",
 ])
@@ -3612,7 +3706,8 @@ class ConversationRunner(object):
                 msg = "Model returned an empty response (finish_reason=%s)." % (finish_reason or "unknown")
             self._on_result_cb(ConversationResult(
                 text="", reasoning_text=reasoning_text, suggested_name=None,
-                suggested_signature=None, suggested_vars=[], suggested_callee_renames=[],
+                suggested_signature=None, suggested_vars=[], suggested_labels=[],
+                suggested_callee_renames=[],
                 suggested_struct=None, suggested_var_types=[], suggested_global_renames=[],
                 suggested_reanalyze=[],
                 root_is_pseudocode=self._root_is_pseudocode, error=msg,
@@ -3666,6 +3761,17 @@ class ConversationRunner(object):
                     if old_name != new_name_var and old_name not in seen_old:
                         seen_old.add(old_name)
                         suggested_vars.append((old_name, new_name_var))
+
+        suggested_labels = []
+        label_matches = _SUGGESTED_LABEL_RE.findall(text)
+        if label_matches:
+            text = _SUGGESTED_LABEL_RE.sub("", text).strip()
+            if self._root_is_pseudocode:
+                seen_old_labels = set()
+                for old_label, new_label in label_matches:
+                    if old_label != new_label and old_label not in seen_old_labels:
+                        seen_old_labels.add(old_label)
+                        suggested_labels.append((old_label, new_label))
 
         suggested_callee_renames = []
         callee_matches = _SUGGESTED_CALLEE_NAME_RE.findall(text)
@@ -3789,7 +3895,8 @@ class ConversationRunner(object):
         self._on_result_cb(ConversationResult(
             text=text, reasoning_text=reasoning_text,
             suggested_name=suggested_name, suggested_signature=suggested_signature,
-            suggested_vars=suggested_vars, suggested_callee_renames=suggested_callee_renames,
+            suggested_vars=suggested_vars, suggested_labels=suggested_labels,
+            suggested_callee_renames=suggested_callee_renames,
             suggested_struct=suggested_struct, suggested_var_types=suggested_var_types,
             suggested_global_renames=suggested_global_renames,
             suggested_reanalyze=suggested_reanalyze,
@@ -3845,6 +3952,7 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self._last_answer_text = ""
         self._closed = False
         self._suggested_vars = []
+        self._suggested_labels = []
         self._suggested_callee_renames = []
         self._suggested_var_types = []
         self._suggested_global_renames = []
@@ -3902,6 +4010,16 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self.varrename_label.setEnabled(False)
         varrename_layout.addWidget(self.varrename_label, 1)
         layout.addLayout(varrename_layout)
+
+        labelrename_layout = QtWidgets.QHBoxLayout()
+        self.labelrename_check = QtWidgets.QCheckBox("Rename code label(s):")
+        self.labelrename_check.setEnabled(False)
+        labelrename_layout.addWidget(self.labelrename_check)
+        self.labelrename_label = QtWidgets.QLineEdit()
+        self.labelrename_label.setReadOnly(True)
+        self.labelrename_label.setEnabled(False)
+        labelrename_layout.addWidget(self.labelrename_label, 1)
+        layout.addLayout(labelrename_layout)
 
         calleerename_layout = QtWidgets.QHBoxLayout()
         self.calleerename_check = QtWidgets.QCheckBox("Rename called function(s) with default names:")
@@ -4049,6 +4167,13 @@ class ExplainResultDialog(QtWidgets.QDialog):
             self.varrename_label.setEnabled(True)
             self.varrename_check.setChecked(True)
 
+        if result.suggested_labels:
+            self._suggested_labels = result.suggested_labels
+            self.labelrename_label.setText(", ".join("%s -> %s" % p for p in result.suggested_labels))
+            self.labelrename_check.setEnabled(True)
+            self.labelrename_label.setEnabled(True)
+            self.labelrename_check.setChecked(True)
+
         if result.suggested_callee_renames:
             self._suggested_callee_renames = result.suggested_callee_renames
             labels = []
@@ -4130,6 +4255,7 @@ class ExplainResultDialog(QtWidgets.QDialog):
         comment = _SUGGESTED_NAME_RE.sub("", comment)
         comment = _SUGGESTED_SIGNATURE_RE.sub("", comment)
         comment = _SUGGESTED_VAR_RE.sub("", comment)
+        comment = _SUGGESTED_LABEL_RE.sub("", comment)
         comment = _SUGGESTED_CALLEE_NAME_RE.sub("", comment)
         comment = _SUGGESTED_GLOBAL_NAME_RE.sub("", comment)
         comment = _SUGGESTED_REANALYZE_RE.sub("", comment)
@@ -4149,6 +4275,10 @@ class ExplainResultDialog(QtWidgets.QDialog):
             signature = self.signature_edit.text().strip()
 
         var_renames = list(self._suggested_vars) if (self.varrename_check.isChecked() and self._suggested_vars) else None
+        label_renames = (
+            list(self._suggested_labels)
+            if (self.labelrename_check.isChecked() and self._suggested_labels) else None
+        )
         callee_renames = (
             list(self._suggested_callee_renames)
             if (self.calleerename_check.isChecked() and self._suggested_callee_renames) else None
@@ -4171,6 +4301,7 @@ class ExplainResultDialog(QtWidgets.QDialog):
             functools.partial(
                 _apply_suggestions_and_refresh, self.func_ea, comment, new_name, signature,
                 var_renames, callee_renames, struct_decl, var_types, global_renames,
+                label_renames,
             ),
             ida_kernwin.MFF_WRITE,
         )
@@ -4686,7 +4817,7 @@ class BatchPickerDialog(QtWidgets.QDialog):
 
 BatchItemResult = namedtuple("BatchItemResult", [
     "func_ea", "orig_name", "ok", "message", "comment",
-    "suggested_name", "suggested_signature", "suggested_vars",
+    "suggested_name", "suggested_signature", "suggested_vars", "suggested_labels",
     "suggested_callee_renames", "suggested_struct", "suggested_var_types",
     "suggested_global_renames", "suggested_reanalyze", "root_is_pseudocode",
 ])
@@ -4712,12 +4843,13 @@ def _compute_apply_args(item, allow_rename_named=False):
     ) else None
     signature = item.suggested_signature if item.root_is_pseudocode else None
     var_renames = item.suggested_vars if (item.root_is_pseudocode and item.suggested_vars) else None
+    label_renames = item.suggested_labels if (item.root_is_pseudocode and item.suggested_labels) else None
     callee_renames = item.suggested_callee_renames or None
     struct_decl = item.suggested_struct if item.root_is_pseudocode else None
     var_types = item.suggested_var_types if (item.root_is_pseudocode and item.suggested_var_types) else None
     global_renames = item.suggested_global_renames or None
     return (item.func_ea, item.comment, new_name, signature, var_renames, callee_renames,
-            struct_decl, var_types, global_renames)
+            struct_decl, var_types, global_renames, label_renames)
 
 
 class BatchController(object):
@@ -4839,12 +4971,13 @@ class BatchController(object):
         label = self.config.server_label(server_url)
         if result.error:
             item = BatchItemResult(func.start_ea, orig_name, False, result.error,
-                                    None, None, None, [], [], None, [], [], [], result.root_is_pseudocode)
+                                    None, None, None, [], [], [], None, [], [], [], result.root_is_pseudocode)
             self._on_row_update(index, "Error", "[%s] %s" % (label, result.error))
         else:
             item = BatchItemResult(func.start_ea, orig_name, True, None, result.text,
                                     result.suggested_name, result.suggested_signature,
-                                    result.suggested_vars, result.suggested_callee_renames,
+                                    result.suggested_vars, result.suggested_labels,
+                                    result.suggested_callee_renames,
                                     result.suggested_struct, result.suggested_var_types,
                                     result.suggested_global_renames, result.suggested_reanalyze,
                                     result.root_is_pseudocode)
@@ -4854,21 +4987,21 @@ class BatchController(object):
     def _on_error(self, index, func, server_url, message):
         orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
         item = BatchItemResult(func.start_ea, orig_name, False, message,
-                                None, None, None, [], [], None, [], [], [], False)
+                                None, None, None, [], [], [], None, [], [], [], False)
         self._on_row_update(index, "Error", "[%s] %s" % (self.config.server_label(server_url), message))
         self._record_and_advance(item, server_url)
 
 
 def _apply_batch_and_refresh(items):
     """items: list of (func_ea, comment, new_name, signature, var_renames,
-    callee_renames, struct_decl, var_types, global_renames). One
-    execute_sync/MFF_WRITE round-trip for the whole batch instead of N.
+    callee_renames, struct_decl, var_types, global_renames, label_renames).
+    One execute_sync/MFF_WRITE round-trip for the whole batch instead of N.
     """
     for (func_ea, comment, new_name, signature, var_renames, callee_renames,
-         struct_decl, var_types, global_renames) in items:
+         struct_decl, var_types, global_renames, label_renames) in items:
         _apply_suggestions_and_refresh(
             func_ea, comment, new_name, signature, var_renames, callee_renames,
-            struct_decl, var_types, global_renames,
+            struct_decl, var_types, global_renames, label_renames,
         )
     return 1
 

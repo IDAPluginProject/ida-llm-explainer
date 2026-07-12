@@ -12,7 +12,7 @@ the Hex-Rays or the disassembly view.
 
 - **Right-click → explain** — pseudocode or disassembly view, or a hotkey (`Ctrl-Alt-E`). Answer streams in live; reasoning models show their chain-of-thought separately.
 - **Human in the loop** — every suggestion is a separate, editable checkbox. Accept / Reason More / Cancel. The model never writes on its own.
-- **Rename & retype** — proposes a function name, full C signature, local-variable renames, **called-function** renames, and **global/data-variable** renames (`byte_…`, `qword_…` → meaningful names).
+- **Rename & retype** — proposes a function name, full C signature, local-variable renames, **code-label** renames (`LABEL_5` → `cleanup_and_return`), **called-function** renames, and **global/data-variable** renames (`byte_…`, `qword_…` → meaningful names).
 - **Struct detection** — infers an undefined struct from pointer-offset access patterns and applies it.
 - **Call-graph aware** — follows callees (configurable depth) and can fetch a specific callee's code on demand mid-answer.
 - **Batch mode** — explain a checklist of functions, review (incl. each proposed new name), apply in bulk.
@@ -69,6 +69,7 @@ The system prompt asks the model to emit structured lines the plugin parses out 
 | `SUGGESTED_NAME: <name>` | function name |
 | `SUGGESTED_SIGNATURE: <decl>` | prototype (Hex-Rays only) |
 | `SUGGESTED_VAR: <old> -> <new>` | local rename (Hex-Rays only) |
+| `SUGGESTED_LABEL: <old> -> <new>` | goto-label rename, e.g. `LABEL_5` (Hex-Rays only) |
 | `SUGGESTED_CALLEE_NAME: <fn> -> <new>` | rename a callee whose code was shown |
 | `SUGGESTED_GLOBAL_NAME: <g> -> <new>` | rename a referenced global/data variable |
 | `SUGGESTED_REANALYZE: <fn> - <why>` | flag an already-named callee for re-analysis (recursive scan) |
