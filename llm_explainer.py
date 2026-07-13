@@ -173,7 +173,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.6.0"
+PLUGIN_VERSION = "1.6.1"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -245,6 +245,15 @@ DEFAULT_SYSTEM_PROMPT = (
     "exact form\n"
     "SUGGESTED_SIGNATURE: <full C declaration>\n"
     "e.g. SUGGESTED_SIGNATURE: int __cdecl parse_header(char *buf, int len)\n"
+    "This prototype is the AUTHORITATIVE source for every ARGUMENT's type, "
+    "so give each argument a specific, correct type inferred from how the "
+    "code actually uses it - a string pointer as char *, a raw byte buffer "
+    "as void * (or BYTE *), a pointer to a known or SUGGESTED_STRUCT type "
+    "as that type *, a count/length as size_t, and so on. Do NOT carry over "
+    "the placeholder types Hex-Rays falls back to when it cannot infer one "
+    "(e.g. __int128 * or _OWORD * for what is really a char * or a struct "
+    "pointer, or a bare __int64 for what is really a pointer or handle); "
+    "correct those to the real type in this signature. "
     "and propose a rename for EVERY local variable (not arguments) whose "
     "default compiler-generated name (e.g. v1, v2, a1) could be more "
     "descriptive - go through each local variable in the code one by one "
@@ -990,7 +999,7 @@ def _rename_lvars(func_ea, var_renames):
             desired = _dedupe_name(desired, taken - {actual_old_name})
 
         try:
-            ok = ida_hexrays.rename_lvar(func_ea, actual_old_name, desired)
+            ok = _set_lvar_name(func_ea, actual_old_name, desired)
         except Exception as exc:
             ok = False
             ida_kernwin.msg("[%s] Failed to rename variable '%s': %s\n" % (PLUGIN_NAME, actual_old_name, exc))
@@ -1008,6 +1017,15 @@ def _rename_lvars(func_ea, var_renames):
             ida_kernwin.msg(
                 "[%s] Failed to rename variable '%s' -> '%s'.\n" % (PLUGIN_NAME, actual_old_name, desired)
             )
+    # The names above were persisted to the database, but the cached
+    # decompilation still holds the old ones - drop it so the follow-on
+    # variable-type step (which locates lvars by their NEW name) and the
+    # final view refresh both re-decompile with the renames applied.
+    if applied:
+        try:
+            ida_hexrays.mark_cfunc_dirty(func_ea)
+        except Exception:
+            pass
     return applied
 
 
@@ -1116,6 +1134,119 @@ def _create_struct_type(decl_text):
         return False
 
 
+def _set_lvar_name(func_ea, var_name, new_name):
+    """Persist a user-defined name for a Hex-Rays local through the
+    lvar_saved_info_t / MLI_NAME mechanism - the same path the Hex-Rays UI
+    itself uses for "Rename lvar", and the same one _set_lvar_type uses for
+    types.
+
+    Deliberately NOT ida_hexrays.rename_lvar(): that convenience wrapper
+    re-decompiles the whole function on every single call and rejects the
+    rename outright (returning False) on the slightest name clash instead
+    of letting Hex-Rays auto-resolve it. Renaming many locals in one large
+    function that way is both slow and unreliable - it was silently
+    failing every SUGGESTED_VAR on big functions. Writing the saved name
+    directly persists it to the database and lets the next decompile apply
+    (and de-collide) it, which is what the UI does.
+    """
+    locator = ida_hexrays.lvar_locator_t()
+    if not ida_hexrays.locate_lvar(locator, func_ea, var_name):
+        return False
+    info = ida_hexrays.lvar_saved_info_t()
+    info.ll = locator
+    info.name = new_name
+    return ida_hexrays.modify_user_lvar_info(func_ea, ida_hexrays.MLI_NAME, info)
+
+
+def _lvar_is_arg(lv):
+    """Is this Hex-Rays local an incoming argument? lvar_t.is_arg_var is a
+    method in the SDK stubs, but some IDA Python builds expose it as a plain
+    bool attribute instead (calling it then raises "'bool' object is not
+    callable") - tolerate both forms.
+    """
+    attr = getattr(lv, "is_arg_var", False)
+    try:
+        return bool(attr() if callable(attr) else attr)
+    except Exception:
+        return False
+
+
+def _tinfo_is_empty(tif):
+    """tinfo_t.empty is normally a method, but guard against the same
+    method-vs-attribute binding quirk that affects lvar_t.is_arg_var so a
+    stray build can't break argument-override cleanup. Treats an
+    inaccessible type as empty (nothing to clear)."""
+    attr = getattr(tif, "empty", True)
+    try:
+        return bool(attr() if callable(attr) else attr)
+    except Exception:
+        return True
+
+
+def _clear_arg_type_overrides(func_ea):
+    """Drop any saved user-defined TYPE override on the function's
+    ARGUMENTS, so a freshly applied prototype's argument types are what the
+    pseudocode view actually shows.
+
+    Hex-Rays gives a saved user lvar type precedence over the function
+    prototype, so a stale override left on an argument by an earlier run
+    (or one the model set on an arg it also declared in the signature)
+    keeps shadowing the new prototype - e.g. still displaying '__int128 *'
+    where the signature now says 'char *'. User NAMES, and any type
+    overrides on genuine locals, are left untouched: only the type field of
+    argument entries is cleared, which makes Hex-Rays fall back to the
+    prototype's argument type for them.
+    """
+    if ida_hexrays is None:
+        return
+    # This whole step is best-effort cleanup AFTER the prototype has already
+    # been applied - it must never raise back into the caller (doing so made
+    # a successful SetType look like a failed one). Any binding quirk is
+    # swallowed here, with the precise location logged for diagnosis.
+    try:
+        if not ida_hexrays.init_hexrays_plugin():
+            return
+        # Re-derive against the prototype we just applied so the argument
+        # set/locations are current (SetType can change them).
+        ida_hexrays.mark_cfunc_dirty(func_ea)
+        cfunc = ida_hexrays.decompile(func_ea)
+        if cfunc is None:
+            return
+        # (defea, location) identifies each argument variable; a saved
+        # override carries the same locator, so this is how we tell arg
+        # entries apart from genuine-local entries in the user settings.
+        arg_locs = [(lv.defea, lv.location) for lv in cfunc.get_lvars() if _lvar_is_arg(lv)]
+        if not arg_locs:
+            return
+
+        lvinf = ida_hexrays.lvar_uservec_t()
+        if not ida_hexrays.restore_user_lvar_settings(lvinf, func_ea):
+            return  # nothing saved -> no override to clear
+        old = lvinf.lvvec
+        new_vec = ida_hexrays.lvar_saved_infos_t()
+        changed = False
+        for i in range(old.size()):
+            si = old.at(i)
+            is_arg = any(
+                si.ll.defea == defea and si.ll.location == loc for defea, loc in arg_locs
+            )
+            if is_arg and not _tinfo_is_empty(si.type):
+                si.type = ida_typeinf.tinfo_t()  # empty -> defer to the prototype
+                changed = True
+            new_vec.push_back(si)
+        if not changed:
+            return
+        lvinf.lvvec = new_vec
+        ida_hexrays.save_user_lvar_settings(func_ea, lvinf)
+        ida_hexrays.mark_cfunc_dirty(func_ea)
+    except Exception:
+        import traceback
+        ida_kernwin.msg(
+            "[%s] Could not reset argument type overrides (prototype was still "
+            "applied):\n%s\n" % (PLUGIN_NAME, traceback.format_exc())
+        )
+
+
 def _set_lvar_type(func_ea, var_name, type_str):
     """Apply a C type expression (e.g. "tagPOINT *") to a Hex-Rays local
     variable. Parses the type via a throwaway variable declaration so
@@ -1209,7 +1340,11 @@ def _apply_suggestions_and_refresh(
             decl = signature.strip()
             if not decl.endswith(";"):
                 decl += ";"
-            if not idc.SetType(func_ea, decl):
+            if idc.SetType(func_ea, decl):
+                # The prototype owns argument types; make sure no stale user
+                # lvar type override shadows them in the pseudocode view.
+                _clear_arg_type_overrides(func_ea)
+            else:
                 ida_kernwin.msg("[%s] Failed to apply signature: %s\n" % (PLUGIN_NAME, signature))
         except Exception as exc:
             ida_kernwin.msg("[%s] Failed to apply signature '%s': %s\n" % (PLUGIN_NAME, signature, exc))
@@ -5012,9 +5147,12 @@ class BatchProgressDialog(QtWidgets.QDialog):
 
     Two modes:
     - auto_apply=False (default, used by "Batch Explain Functions..."):
-      never auto-writes - Cancel-while-running, then an Apply-Selected-
-      after-review step, matching the plugin's human-in-the-loop
-      philosophy used everywhere else.
+      has its own "Auto-apply when Done" checkbox, checked by default -
+      each function's suggestions are applied the moment its row reaches
+      "Done" rather than waiting for a manual Apply Selected click at the
+      end. Unchecking it reverts to the original human-in-the-loop
+      behavior: never auto-writes - Cancel-while-running, then an
+      Apply-Selected-after-review step.
     - auto_apply=True (used by "Explain function with LLM (recursively)"):
       each function's suggestions are applied automatically the moment
       that function finishes, with the same conservative defaults the
@@ -5041,6 +5179,11 @@ class BatchProgressDialog(QtWidgets.QDialog):
         # apply is allowed to replace an existing non-default name (that's
         # the whole point of re-analyzing them). See _on_item_auto_apply.
         self._reanalysis_eas = set()
+        # eas already written to the database, whether via the live
+        # "Auto-apply when Done" path or the end-of-batch Apply Selected
+        # step - prevents Apply Selected from re-applying (and thus
+        # clobbering undo history for) a function already applied live.
+        self._applied_eas = set()
 
         self.table = QtWidgets.QTableWidget(len(funcs), 5)
         apply_header = "Applied" if auto_apply else "Apply"
@@ -5069,7 +5212,22 @@ class BatchProgressDialog(QtWidgets.QDialog):
         self.close_button = QtWidgets.QPushButton("Close")
         self.close_button.clicked.connect(self.close)
 
+        # Opt-in live-apply toggle - only meaningful in manual mode, since
+        # auto_apply=True already applies every result as it lands.
+        self.live_apply_checkbox = None
+        if not auto_apply:
+            self.live_apply_checkbox = QtWidgets.QCheckBox("Auto-apply when Done")
+            self.live_apply_checkbox.setChecked(True)
+            self.live_apply_checkbox.setToolTip(
+                "Apply each function's suggestions as soon as its status "
+                "becomes Done, instead of reviewing and clicking Apply "
+                "Selected once the whole batch finishes. Uncheck to go "
+                "back to review-then-apply."
+            )
+
         button_row = QtWidgets.QHBoxLayout()
+        if self.live_apply_checkbox is not None:
+            button_row.addWidget(self.live_apply_checkbox)
         button_row.addStretch(1)
         button_row.addWidget(self.cancel_button)
         button_row.addWidget(self.apply_button)
@@ -5127,10 +5285,13 @@ class BatchProgressDialog(QtWidgets.QDialog):
                     and not allow_named and not is_auto_generated_name(item.orig_name)):
                 text += "  (kept: %s)" % item.orig_name
             self.table.item(row, self.COL_NEW_NAME).setText(text)
-        if self.auto_apply:
+        live_apply = self.live_apply_checkbox is not None and self.live_apply_checkbox.isChecked()
+        if self.auto_apply or live_apply:
             self._on_item_auto_apply(item)
 
     def _on_item_auto_apply(self, item):
+        if item.func_ea in self._applied_eas:
+            return
         # A function pulled in by SUGGESTED_REANALYZE is allowed to have its
         # existing (non-default) name replaced - that's why it was re-queued.
         allow_named = item.func_ea in self._reanalysis_eas
@@ -5139,6 +5300,7 @@ class BatchProgressDialog(QtWidgets.QDialog):
             ida_kernwin.execute_sync(
                 functools.partial(_apply_suggestions_and_refresh, *args), ida_kernwin.MFF_WRITE
             )
+            self._applied_eas.add(item.func_ea)
         row = self._row_by_ea.get(item.func_ea)
         if row is not None:
             check_item = self.table.item(row, self.COL_APPLY)
@@ -5180,6 +5342,8 @@ class BatchProgressDialog(QtWidgets.QDialog):
     def _apply_selected(self):
         items_to_apply = []
         for i, func in enumerate(self.funcs):
+            if func.start_ea in self._applied_eas:
+                continue
             if self.table.item(i, self.COL_APPLY).checkState() != QtCore.Qt.CheckState.Checked:
                 continue
             args = _compute_apply_args(self.controller.results.get(func.start_ea))
