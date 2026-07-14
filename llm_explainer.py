@@ -5042,6 +5042,12 @@ class BatchController(object):
         self._on_row_add(index, func)
         return True
 
+    def active_count(self):
+        """Number of functions currently in flight (at most one per
+        configured server), for the progress dialog's running/queued
+        counters."""
+        return len(self._active)
+
     def start(self):
         for server_url in self._servers:
             self._dispatch_next(server_url)
@@ -5185,6 +5191,21 @@ class BatchProgressDialog(QtWidgets.QDialog):
         # clobbering undo history for) a function already applied live.
         self._applied_eas = set()
 
+        # Progress/timing state. _start_times: ea -> wall time the row first
+        # went Running; _durations: completed per-function LLM run times, for
+        # the average; _completed/_errors: running tallies; _batch_start:
+        # anchor for the wall-clock throughput the ETA is derived from (that
+        # rate naturally accounts for N servers running in parallel).
+        self.controller = None
+        self._start_times = {}
+        self._durations = []
+        self._completed = 0
+        self._errors = 0
+        self._cancelled_rows = 0
+        self._batch_start = time.time()
+
+        self.progress_label = QtWidgets.QLabel()
+
         self.table = QtWidgets.QTableWidget(len(funcs), 5)
         apply_header = "Applied" if auto_apply else "Apply"
         self.table.setHorizontalHeaderLabels(
@@ -5234,9 +5255,12 @@ class BatchProgressDialog(QtWidgets.QDialog):
         button_row.addWidget(self.close_button)
 
         layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.progress_label)
         layout.addWidget(self.table, 1)
         layout.addLayout(button_row)
         _add_copyright_footer(layout)
+
+        self._update_progress_label()
 
         self.controller = BatchController(
             config, funcs, self._on_row_update, self._on_batch_finished,
@@ -5249,9 +5273,70 @@ class BatchProgressDialog(QtWidgets.QDialog):
         self.controller.start()
 
     def _on_row_update(self, index, status, preview):
+        self._note_status(index, status)
         self.table.item(index, self.COL_STATUS).setText(status)
         if preview:
             self.table.item(index, self.COL_PREVIEW).setText(preview)
+        self._update_progress_label()
+
+    def _note_status(self, index, status):
+        """Feed the progress/timing tallies from row status transitions:
+        the first Running update stamps the function's start time (later
+        Running updates are streaming-status refreshes, not restarts);
+        Done/Error closes it out into the per-function duration list."""
+        ea = self.funcs[index].start_ea
+        if status == "Running":
+            self._start_times.setdefault(ea, time.time())
+            return
+        if status == "Cancelled":
+            self._start_times.pop(ea, None)
+            self._cancelled_rows += 1
+            return
+        if status not in ("Done", "Error"):
+            return
+        started = self._start_times.pop(ea, None)
+        if started is not None:
+            self._durations.append(time.time() - started)
+        if status == "Done":
+            self._completed += 1
+        else:
+            self._errors += 1
+
+    @staticmethod
+    def _format_duration(seconds):
+        seconds = int(round(seconds))
+        if seconds < 60:
+            return "%ds" % seconds
+        if seconds < 3600:
+            return "%dm %02ds" % (seconds // 60, seconds % 60)
+        return "%dh %02dm" % (seconds // 3600, (seconds % 3600) // 60)
+
+    def _update_progress_label(self):
+        total = len(self.funcs)
+        finished = self._completed + self._errors
+        running = self.controller.active_count() if self.controller is not None else 0
+        parts = ["%d / %d done" % (finished, total)]
+        if self._errors:
+            parts.append("%d errors" % self._errors)
+        if running:
+            parts.append("%d running" % running)
+        if self._cancelled_rows:
+            parts.append("%d cancelled" % self._cancelled_rows)
+        queued = total - finished - running - self._cancelled_rows
+        if queued > 0:
+            parts.append("%d queued" % queued)
+        if self._durations:
+            avg = sum(self._durations) / len(self._durations)
+            parts.append("avg %s/function" % self._format_duration(avg))
+        remaining = running + max(0, queued)
+        if finished and remaining:
+            # Whole-batch wall-clock throughput, so the estimate reflects
+            # however many servers are actually running in parallel.
+            elapsed = time.time() - self._batch_start
+            if elapsed > 0:
+                parts.append("ETA %s" % self._format_duration(
+                    remaining * elapsed / finished))
+        self.progress_label.setText("   |   ".join(parts))
 
     def _on_row_add_dynamic(self, index, func):
         """A SUGGESTED_REANALYZE request appended `func` to the controller's
